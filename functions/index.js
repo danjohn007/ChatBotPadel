@@ -15,16 +15,16 @@ import axios from "axios";                                // Cliente HTTP (para 
 // Cada uno corresponde a un valor almacenado en Firebase Secrets Manager.
 // Así evitamos exponer contraseñas o tokens en el código.
 
-const VERIFY_TOKEN = defineSecret("VERIFY_TOKEN_CAJABOT");// 278270
-const WHATSAPP_TOKEN = defineSecret("WHATSAPP_TOKEN_CAJABOT");// 
-const WHATSAPP_PHONE_NUMBER_ID = defineSecret("WHATSAPP_PHONE_NUMBER_ID_CAJABOT"); //  
+const VERIFY_TOKEN = defineSecret("VERIFY_TOKEN_PADEL");// 080126
+const WHATSAPP_TOKEN = defineSecret("WHATSAPP_TOKEN_PADEL");//      EAAWo4kbaxUUBQamz7cU7r4R5JTZACZBaDRMnfWALtCrI6352WepUPkubugp7lHOKZAM02PBTwtVWKeZBe448WDOZA3mjWHBtoRjZCq1ULkZAugf5IVb7ZBFtDzo0Vweem5qoSZBqbFnMTLf1huDG8ZAAarVMZCWfNfdOebNhZBN32GYoKi8jrBJ3foAjZCXSqg542xQdmeQZDZD
+const WHATSAPP_PHONE_NUMBER_ID = defineSecret("WHATSAPP_PHONE_NUMBER_ID_PADEL"); //    959279237268322
 
 
 // Configuración de conexión a base de datos MySQL
-const DB_HOST = defineSecret("DB_HOST_CAJABOT");
-const DB_USER = defineSecret("DB_USER_CAJABOT");
-const DB_PASSWORD = defineSecret("DB_PASSWORD_CAJABOT");
-const DB_NAME = defineSecret("DB_NAME_CAJABOT");
+const DB_HOST = defineSecret("DB_HOST_PADEL");//           arosports.app
+const DB_USER = defineSecret("DB_USER_PADEL");//           arosport_arosports
+const DB_PASSWORD = defineSecret("DB_PASSWORD_PADEL");//   6F*HkXyk!udw
+const DB_NAME = defineSecret("DB_NAME_PADEL");//           arosport_arosports
 
 // =========================================================
 // 🗄️ CONEXIÓN A MYSQL (Pool Lazy)
@@ -81,7 +81,7 @@ async function sendWhatsAppText({ to, text, token, phoneNumberId }) {
 // - Verifica el token (GET)
 // - Responde "Hola" a cualquier mensaje de texto (POST)
 
-export const whatsappWebhookCajaBot = onRequest(
+export const whatsappWebhookPadel = onRequest(
   {
     cors: true,
     region: "us-central1",
