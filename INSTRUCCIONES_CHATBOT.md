@@ -15,14 +15,14 @@ Chatbot conversacional de WhatsApp que ayuda a los usuarios a:
 ## 🎯 Flujos Implementados
 
 ### 1️⃣ Reservar Cancha
-**Flujo completo paso a paso:**
+**Flujo completo paso a paso (con listas interactivas):**
 1. Usuario selecciona opción "1"
-2. Bot pregunta: ¿En qué ciudad?
-3. Usuario responde: "Querétaro"
-4. Bot pregunta: ¿A qué hora?
-5. Usuario responde: "7pm"
-6. Bot muestra clubs disponibles en esa ciudad
-7. Usuario selecciona un club (1, 2, 3...)
+2. Bot muestra **lista interactiva de ciudades disponibles**
+3. Usuario selecciona ciudad desde la lista
+4. Bot muestra **lista interactiva de clubs** en esa ciudad
+5. Usuario selecciona club desde la lista
+6. Bot muestra **lista interactiva de horarios disponibles** según la base de datos
+7. Usuario selecciona horario desde la lista
 8. Bot pregunta: ¿Cuántos jugadores?
 9. Usuario responde: "4"
 10. Bot pregunta: ¿Cuántas horas?
@@ -102,10 +102,42 @@ Cada usuario tiene un registro en la tabla `user_drafts` con estructura JSON:
 
 | Flujo | Pasos |
 |-------|-------|
-| **reservas** | inicio → pedir_ciudad → pedir_horario → seleccionar_club → pedir_jugadores → pedir_duracion |
+| **reservas** | inicio (lista ciudades) → seleccionar_club (lista clubs) → seleccionar_horario (lista horarios DB) → pedir_jugadores → pedir_duracion |
 | **buscar_clubs** | inicio → pedir_ubicacion |
 | **info_club** | inicio → pedir_nombre → menu_info |
 | **problemas** | inicio → seleccionar_problema → [diversos sub-pasos] |
+
+### 📱 Listas Interactivas de WhatsApp
+
+El chatbot utiliza **listas interactivas nativas de WhatsApp** para mejorar la experiencia del usuario:
+
+**¿Qué son?**
+- Menús desplegables oficiales de WhatsApp
+- El usuario toca un botón y se abre una lista seleccionable
+- No requiere escribir texto, solo tocar la opción deseada
+
+**Implementación en Reservas:**
+- **Ciudades**: Lista con todas las ciudades disponibles en la BD
+- **Clubs**: Lista filtrada por ciudad seleccionada
+- **Horarios**: Lista dinámica con horarios disponibles según club (desde tabla `horarios_club`)
+
+**Formato técnico:**
+```json
+{
+  "type": "list",
+  "headerText": "🏙️ Selecciona tu ciudad",
+  "bodyText": "Elige la ciudad donde...",
+  "buttonText": "Ver ciudades",
+  "sections": [
+    {
+      "title": "Ciudades disponibles",
+      "rows": [
+        {"id": "ciudad_0", "title": "Querétaro", "description": "📍 Clubs en Querétaro"}
+      ]
+    }
+  ]
+}
+```
 
 ---
 
@@ -116,7 +148,7 @@ El chatbot **solo lee** de estas tablas:
 - `fraccionamiento_club`: Información de clubs
 - `direccion`: Ubicaciones y coordenadas
 - `canchas`: Canchas disponibles por club
-- `horarios_club`: Horarios de operación
+- `horarios_club`: Horarios de operación (usados en listas interactivas)
 - `user_drafts`: Estado conversacional (read/write)
 
 ---

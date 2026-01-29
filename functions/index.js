@@ -51,10 +51,12 @@ function getPool(cfg) {
 }
 
 // =========================================================
-// 💬 FUNCIÓN PARA ENVIAR MENSAJES DE TEXTO POR WHATSAPP
+// 💬 FUNCIONES PARA ENVIAR MENSAJES POR WHATSAPP
 // =========================================================
-// Usa la Graph API v20.0 para enviar mensajes desde el bot al usuario.
 
+/**
+ * Envía un mensaje de texto simple
+ */
 async function sendWhatsAppText({ to, text, token, phoneNumberId }) {
   const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
   await axios.post(
@@ -70,7 +72,43 @@ async function sendWhatsAppText({ to, text, token, phoneNumberId }) {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-      timeout: 15000, // Timeout de 15 segundos
+      timeout: 15000,
+    }
+  );
+}
+
+/**
+ * Envía una lista interactiva de WhatsApp
+ */
+async function sendWhatsAppList({ to, headerText, bodyText, buttonText, sections, token, phoneNumberId }) {
+  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
+  await axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "list",
+        header: {
+          type: "text",
+          text: headerText,
+        },
+        body: {
+          text: bodyText,
+        },
+        action: {
+          button: buttonText,
+          sections: sections,
+        },
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
     }
   );
 }
@@ -176,98 +214,258 @@ _Escribe "Cancelar" en cualquier momento para volver al menú principal._`;
 }
 
 /**
- * Flujo 1: Reservar Cancha
+ * Flujo 1: Reservar Cancha (Mejorado con listas interactivas)
  */
-async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, draft) {
-  // PASO 1: Pedir ciudad
+async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, draft, token, phoneNumberId) {
+  // PASO 1: Mostrar ciudades disponibles en lista interactiva
   if (currentStep === "inicio") {
-    await setFlow(pool, phoneNumber, "reservas", "pedir_ciudad");
-    return "¿En qué ciudad quieres jugar? (Ejemplo: Querétaro, Puebla)";
+    // Obtener ciudades únicas de clubs activos
+    const [ciudades] = await pool.query(
+      `SELECT DISTINCT d.estado as ciudad
+       FROM fraccionamiento_club fc
+       INNER JOIN direccion d ON fc.id_direccion = d.id_direccion
+       WHERE fc.id_status = 1 AND d.estado IS NOT NULL AND d.estado != ''
+       ORDER BY d.estado
+       LIMIT 10`
+    );
+
+    if (ciudades.length === 0) {
+      await clearFlow(pool, phoneNumber);
+      return {
+        type: "text",
+        text: "❌ No hay ciudades disponibles en este momento.\n\n" + menuPrincipal(),
+      };
+    }
+
+    await setFlow(pool, phoneNumber, "reservas", "seleccionar_ciudad");
+
+    // Crear secciones para la lista interactiva
+    const rows = ciudades.map((c, idx) => ({
+      id: `ciudad_${idx}`,
+      title: c.ciudad || "Sin nombre",
+      description: `Clubs en ${c.ciudad}`,
+    }));
+
+    return {
+      type: "list",
+      headerText: "🏙️ Ciudades Disponibles",
+      bodyText: "Selecciona la ciudad donde quieres jugar:",
+      buttonText: "Ver ciudades",
+      sections: [
+        {
+          title: "Selecciona tu ciudad",
+          rows: rows,
+        },
+      ],
+    };
   }
 
-  // PASO 2: Capturar ciudad y pedir horario
-  if (currentStep === "pedir_ciudad") {
-    await saveDraftData(pool, phoneNumber, "ciudad", userInput);
-    await setFlow(pool, phoneNumber, "reservas", "pedir_horario");
-    return "¿A qué hora quieres jugar? (Ejemplo: 7pm, 19:00)";
-  }
+  // PASO 2: Capturar ciudad y mostrar clubs disponibles
+  if (currentStep === "seleccionar_ciudad") {
+    // Obtener ciudades para mapear la selección
+    const [ciudades] = await pool.query(
+      `SELECT DISTINCT d.estado as ciudad
+       FROM fraccionamiento_club fc
+       INNER JOIN direccion d ON fc.id_direccion = d.id_direccion
+       WHERE fc.id_status = 1 AND d.estado IS NOT NULL AND d.estado != ''
+       ORDER BY d.estado
+       LIMIT 10`
+    );
 
-  // PASO 3: Capturar horario y buscar clubs disponibles
-  if (currentStep === "pedir_horario") {
-    await saveDraftData(pool, phoneNumber, "horario", userInput);
-    
-    const ciudad = await getDraftData(pool, phoneNumber, "ciudad");
-    
-    // Consultar clubs disponibles (DEMO - solo lectura)
+    let ciudadSeleccionada = null;
+
+    // Si viene de lista interactiva
+    if (userInput.startsWith("ciudad_")) {
+      const index = parseInt(userInput.split("_")[1]);
+      if (index >= 0 && index < ciudades.length) {
+        ciudadSeleccionada = ciudades[index].ciudad;
+      }
+    }
+
+    if (!ciudadSeleccionada) {
+      return {
+        type: "text",
+        text: "❌ Selección inválida. Por favor selecciona una ciudad de la lista.",
+      };
+    }
+
+    // Guardar ciudad seleccionada
+    await saveDraftData(pool, phoneNumber, "ciudad", ciudadSeleccionada);
+
+    // Buscar clubs en esa ciudad
     const [clubs] = await pool.query(
-      `SELECT fc.id_fraccionamientoclub, fc.fc_nombre, d.estado
+      `SELECT fc.id_fraccionamientoclub, fc.fc_nombre, d.colonia
        FROM fraccionamiento_club fc
        INNER JOIN direccion d ON fc.id_direccion = d.id_direccion
        WHERE d.estado LIKE ? AND fc.id_status = 1
-       LIMIT 3`,
-      [`%${ciudad}%`]
+       LIMIT 10`,
+      [`%${ciudadSeleccionada}%`]
     );
 
     if (clubs.length === 0) {
       await clearFlow(pool, phoneNumber);
-      return `No encontré clubs disponibles en *${ciudad}*. 
-
-${menuPrincipal()}`;
+      return {
+        type: "text",
+        text: `❌ No encontré clubs disponibles en *${ciudadSeleccionada}*.\n\n${menuPrincipal()}`,
+      };
     }
 
     // Guardar clubs encontrados
     await saveDraftData(pool, phoneNumber, "clubs_disponibles", clubs);
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
 
-    let response = `He encontrado ${clubs.length} clubs disponibles en *${ciudad}*:\n\n`;
-    clubs.forEach((club, idx) => {
-      response += `${idx + 1}️⃣ ${club.fc_nombre}\n`;
-    });
-    response += "\n● Elige el número del club donde quieras reservar.";
+    // Crear lista interactiva de clubs
+    const rows = clubs.map((club, idx) => ({
+      id: `club_${idx}`,
+      title: club.fc_nombre.substring(0, 24), // WhatsApp limita a 24 chars
+      description: club.colonia ? `📍 ${club.colonia.substring(0, 72)}` : "Club de pádel",
+    }));
 
-    return response;
+    return {
+      type: "list",
+      headerText: `🏟️ Clubs en ${ciudadSeleccionada}`,
+      bodyText: `Encontré ${clubs.length} club${clubs.length > 1 ? "s" : ""} disponible${clubs.length > 1 ? "s" : ""}. Selecciona uno:`,
+      buttonText: "Ver clubs",
+      sections: [
+        {
+          title: "Clubs disponibles",
+          rows: rows,
+        },
+      ],
+    };
   }
 
-  // PASO 4: Seleccionar club y pedir número de jugadores
+  // PASO 3: Capturar club y mostrar horarios disponibles
   if (currentStep === "seleccionar_club") {
-    const seleccion = parseInt(userInput);
     const clubs = await getDraftData(pool, phoneNumber, "clubs_disponibles");
+    let clubSeleccionado = null;
 
-    if (isNaN(seleccion) || seleccion < 1 || seleccion > clubs.length) {
-      return "❌ Selección inválida. Por favor elige un número de la lista.";
+    // Si viene de lista interactiva
+    if (userInput.startsWith("club_")) {
+      const index = parseInt(userInput.split("_")[1]);
+      if (index >= 0 && index < clubs.length) {
+        clubSeleccionado = clubs[index];
+      }
     }
 
-    const clubSeleccionado = clubs[seleccion - 1];
+    if (!clubSeleccionado) {
+      return {
+        type: "text",
+        text: "❌ Selección inválida. Por favor selecciona un club de la lista.",
+      };
+    }
+
+    // Guardar club seleccionado
     await saveDraftData(pool, phoneNumber, "club_id", clubSeleccionado.id_fraccionamientoclub);
     await saveDraftData(pool, phoneNumber, "club_nombre", clubSeleccionado.fc_nombre);
+
+    // Obtener horarios disponibles del club para hoy (DEMO - simplificado)
+    const [horarios] = await pool.query(
+      `SELECT DISTINCT hora_inicio, hora_fin 
+       FROM horarios_club 
+       WHERE id_fraccionamientoclub = ? AND estatus = 1
+       ORDER BY hora_inicio
+       LIMIT 10`,
+      [clubSeleccionado.id_fraccionamientoclub]
+    );
+
+    if (horarios.length === 0) {
+      await clearFlow(pool, phoneNumber);
+      return {
+        type: "text",
+        text: `❌ No hay horarios disponibles para *${clubSeleccionado.fc_nombre}*.\n\n${menuPrincipal()}`,
+      };
+    }
+
+    await saveDraftData(pool, phoneNumber, "horarios_disponibles", horarios);
+    await setFlow(pool, phoneNumber, "reservas", "seleccionar_horario");
+
+    // Crear lista interactiva de horarios
+    const rows = horarios.map((h, idx) => {
+      const inicio = h.hora_inicio.substring(0, 5);
+      const fin = h.hora_fin.substring(0, 5);
+      return {
+        id: `horario_${idx}`,
+        title: `${inicio} - ${fin}`,
+        description: `Disponible en ${clubSeleccionado.fc_nombre}`,
+      };
+    });
+
+    return {
+      type: "list",
+      headerText: `⏰ Horarios Disponibles`,
+      bodyText: `Selecciona el horario para tu reserva en *${clubSeleccionado.fc_nombre}*:`,
+      buttonText: "Ver horarios",
+      sections: [
+        {
+          title: "Horarios del día",
+          rows: rows,
+        },
+      ],
+    };
+  }
+
+  // PASO 4: Capturar horario y pedir número de jugadores
+  if (currentStep === "seleccionar_horario") {
+    const horarios = await getDraftData(pool, phoneNumber, "horarios_disponibles");
+    let horarioSeleccionado = null;
+
+    // Si viene de lista interactiva
+    if (userInput.startsWith("horario_")) {
+      const index = parseInt(userInput.split("_")[1]);
+      if (index >= 0 && index < horarios.length) {
+        horarioSeleccionado = horarios[index];
+      }
+    }
+
+    if (!horarioSeleccionado) {
+      return {
+        type: "text",
+        text: "❌ Selección inválida. Por favor selecciona un horario de la lista.",
+      };
+    }
+
+    const horaInicio = horarioSeleccionado.hora_inicio.substring(0, 5);
+    await saveDraftData(pool, phoneNumber, "horario", horaInicio);
     await setFlow(pool, phoneNumber, "reservas", "pedir_jugadores");
 
-    return `Perfecto, seleccionaste *${clubSeleccionado.fc_nombre}*. 
-
-¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)`;
+    return {
+      type: "text",
+      text: `Perfecto, has seleccionado el horario *${horaInicio}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)`,
+    };
   }
 
   // PASO 5: Capturar número de jugadores y pedir duración
   if (currentStep === "pedir_jugadores") {
     const numJugadores = parseInt(userInput);
     if (isNaN(numJugadores) || numJugadores < 2) {
-      return "❌ Por favor ingresa un número válido de jugadores (mínimo 2).";
+      return {
+        type: "text",
+        text: "❌ Por favor ingresa un número válido de jugadores (mínimo 2).",
+      };
     }
 
     await saveDraftData(pool, phoneNumber, "num_jugadores", numJugadores);
     await setFlow(pool, phoneNumber, "reservas", "pedir_duracion");
 
-    return "Genial, la reserva será para " + numJugadores + " personas. \n\n¿Por cuántas horas deseas reservar la cancha? (Ejemplo: 1 hora, 2 horas)";
+    return {
+      type: "text",
+      text: `Genial, la reserva será para ${numJugadores} persona${numJugadores > 1 ? "s" : ""}.\n\n¿Por cuántas horas deseas reservar la cancha? (Ejemplo: 1, 2, 3)`,
+    };
   }
 
   // PASO 6: Confirmar reserva (DEMO - no guarda en BD)
   if (currentStep === "pedir_duracion") {
     const duracion = parseInt(userInput);
     if (isNaN(duracion) || duracion < 1) {
-      return "❌ Por favor ingresa un número válido de horas.";
+      return {
+        type: "text",
+        text: "❌ Por favor ingresa un número válido de horas (ejemplo: 1, 2, 3).",
+      };
     }
 
     // Recuperar todos los datos
+    const ciudad = await getDraftData(pool, phoneNumber, "ciudad");
     const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
     const horario = await getDraftData(pool, phoneNumber, "horario");
     const numJugadores = await getDraftData(pool, phoneNumber, "num_jugadores");
@@ -275,16 +473,20 @@ ${menuPrincipal()}`;
     // Limpiar draft
     await clearFlow(pool, phoneNumber);
 
-    return `✅ *Reserva Confirmada* ✅
+    return {
+      type: "text",
+      text: `✅ *Reserva Confirmada* ✅
 
-● Club: ${clubNombre}
-● Hora: ${horario}
-● Duración: ${duracion} hora${duracion > 1 ? 's' : ''}
-● Jugadores: ${numJugadores} persona${numJugadores > 1 ? 's' : ''}
+📍 *Ciudad:* ${ciudad}
+🏟️ *Club:* ${clubNombre}
+⏰ *Hora:* ${horario}
+⌛ *Duración:* ${duracion} hora${duracion > 1 ? "s" : ""}
+👥 *Jugadores:* ${numJugadores} persona${numJugadores > 1 ? "s" : ""}
 
-_NOTA: Esta es una DEMO. No se ha guardado ninguna reserva real en la base de datos._
+💡 _NOTA: Esta es una DEMO. No se ha guardado ninguna reserva real en la base de datos._
 
-${menuPrincipal()}`;
+${menuPrincipal()}`,
+    };
   }
 }
 
@@ -295,7 +497,10 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
   // PASO 1: Pedir ubicación
   if (currentStep === "inicio") {
     await setFlow(pool, phoneNumber, "buscar_clubs", "pedir_ubicacion");
-    return "¿En qué ciudad te encuentras? (Ejemplo: Ciudad de México, Querétaro)";
+    return {
+      type: "text",
+      text: "¿En qué ciudad te encuentras? (Ejemplo: Ciudad de México, Querétaro)",
+    };
   }
 
   // PASO 2: Buscar clubs y mostrar resultados
@@ -313,19 +518,17 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
     await clearFlow(pool, phoneNumber);
 
     if (clubs.length === 0) {
-      return `❌ No encontré clubs cerca de *${userInput}*.
-
-${menuPrincipal()}`;
+      return { type: "text", text: `❌ No encontré clubs cerca de *${userInput}*.\n\n${menuPrincipal()}` };
     }
 
-    let response = `He encontrado estos clubs cerca de tu ubicación en *${userInput}*:\n\n`;
+    let text = `He encontrado estos clubs cerca de tu ubicación en *${userInput}*:\n\n`;
     clubs.forEach((club, idx) => {
-      response += `${idx + 1}️⃣ *${club.fc_nombre}*\n`;
-      response += `   📍 ${club.calle || 'Dirección no disponible'} ${club.num_ext || ''}, ${club.colonia || ''}, CP ${club.cp || ''}\n\n`;
+      text += `${idx + 1}️⃣ *${club.fc_nombre}*\n`;
+      text += `   📍 ${club.calle || 'Dirección no disponible'} ${club.num_ext || ''}, ${club.colonia || ''}, CP ${club.cp || ''}\n\n`;
     });
 
-    response += `\n${menuPrincipal()}`;
-    return response;
+    text += `\n${menuPrincipal()}`;
+    return { type: "text", text };
   }
 }
 
@@ -336,7 +539,10 @@ async function handleFlujoInfoClub(pool, phoneNumber, userInput, currentStep, dr
   // PASO 1: Pedir nombre del club
   if (currentStep === "inicio") {
     await setFlow(pool, phoneNumber, "info_club", "pedir_nombre");
-    return "¿Qué club te interesa? Escribe el nombre del club.";
+    return {
+      type: "text",
+      text: "¿Qué club te interesa? Escribe el nombre del club.",
+    };
   }
 
   // PASO 2: Buscar información del club
@@ -355,9 +561,12 @@ async function handleFlujoInfoClub(pool, phoneNumber, userInput, currentStep, dr
 
     if (clubs.length === 0) {
       await clearFlow(pool, phoneNumber);
-      return `❌ No encontré información sobre *${userInput}*.
+      return {
+        type: "text",
+        text: `❌ No encontré información sobre *${userInput}*.
 
-${menuPrincipal()}`;
+${menuPrincipal()}`,
+      };
     }
 
     const club = clubs[0];
@@ -401,12 +610,12 @@ ${menuPrincipal()}`;
       await saveDraftData(pool, phoneNumber, "club_nombre", clubInfo.fc_nombre);
       await setFlow(pool, phoneNumber, "reservas", "pedir_jugadores");
       
-      return `Perfecto, reservaremos en *${clubInfo.fc_nombre}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)`;
+      return { type: "text", text: `Perfecto, reservaremos en *${clubInfo.fc_nombre}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)` };
     } else if (userInput === "2") {
       await clearFlow(pool, phoneNumber);
-      return menuPrincipal();
+      return { type: "text", text: menuPrincipal() };
     } else {
-      return "❌ Opción inválida. Por favor elige 1 o 2.";
+      return { type: "text", text: "❌ Opción inválida. Por favor elige 1 o 2." };
     }
   }
 }
@@ -418,12 +627,15 @@ async function handleFlujoProblemas(pool, phoneNumber, userInput, currentStep, d
   // PASO 1: Mostrar menú de problemas
   if (currentStep === "inicio") {
     await setFlow(pool, phoneNumber, "problemas", "seleccionar_problema");
-    return `Entiendo, vamos a revisar tu problema. Por favor selecciona:
+    return {
+      type: "text",
+      text: `Entiendo, vamos a revisar tu problema. Por favor selecciona:
 
 1️⃣ ¿El club aparece como no disponible?
 2️⃣ ¿El sistema te marca error al confirmar?
 3️⃣ ¿Tu pago no se procesó?
-4️⃣ Otro problema`;
+4️⃣ Otro problema`,
+    };
   }
 
   // PASO 2: Procesar problema seleccionado
@@ -480,31 +692,40 @@ _NOTA DEMO: En un sistema real, aquí se levantaría un ticket de soporte y se s
       default:
         response = "❌ Opción inválida. Por favor elige un número del 1 al 4.";
     }
-    
-    return response;
+
+    return {
+      type: "text",
+      text: response,
+    };
   }
 
   // PASO 3: Opciones después de "no disponible"
   if (currentStep === "opciones_no_disponible") {
     if (userInput === "1") {
-      await setFlow(pool, phoneNumber, "reservas", "pedir_ciudad");
-      return "¿En qué ciudad quieres buscar clubs? (Ejemplo: Querétaro, Puebla)";
+      await setFlow(pool, phoneNumber, "reservas", "inicio");
+      return await handleFlujoReservas(pool, phoneNumber, userInput, "inicio", draft);
     } else {
       await clearFlow(pool, phoneNumber);
-      return menuPrincipal();
+      return {
+        type: "text",
+        text: menuPrincipal(),
+      };
     }
   }
 
   // PASO 4: Capturar descripción de "otro problema"
   if (currentStep === "pedir_descripcion") {
     await clearFlow(pool, phoneNumber);
-    return `✅ Hemos registrado tu problema:
+    return {
+      type: "text",
+      text: `✅ Hemos registrado tu problema:
 
 "${userInput}"
 
 _NOTA DEMO: En un sistema real, esto se guardaría como un ticket de soporte._
 
-${menuPrincipal()}`;
+${menuPrincipal()}`,
+    };
   }
 }
 
@@ -563,24 +784,29 @@ export const whatsappWebhookPadel = onRequest(
       const phoneNumberId = cfg.WHATSAPP_PHONE_NUMBER_ID;
       const msg = messages[0];
 
-      // Solo procesa mensajes de tipo texto
-      if (!msg || msg.type !== "text") {
+      // Procesa mensajes de texto o interactivos
+      let userInput = "";
+      if (msg.type === "text") {
+        userInput = msg.text.body.trim();
+      } else if (msg.type === "interactive") {
+        // Mensajes de respuesta a listas o botones interactivos
+        userInput = msg.interactive?.list_reply?.id || msg.interactive?.button_reply?.id || "";
+      } else {
         return res.sendStatus(200);
       }
 
-      const userInput = msg.text.body.trim();
       const pool = getPool(cfg);
 
       // =========================================================
       // 🎯 ROUTER CENTRAL - Procesamiento de mensajes
       // =========================================================
 
-      let responseText = "";
+      let response = null;
 
       // 1. REINICIAR FLUJO: "Hola" o "Cancelar"
       if (userInput.toLowerCase() === "hola" || userInput.toLowerCase() === "cancelar") {
         await clearFlow(pool, from);
-        responseText = menuPrincipal();
+        response = { type: "text", text: menuPrincipal() };
       } else {
         // 2. LEER ESTADO ACTUAL
         const draft = await getDraft(pool, from);
@@ -589,52 +815,64 @@ export const whatsappWebhookPadel = onRequest(
         if (!draft || !draft.flow || draft.step === "menu") {
           if (userInput === "1") {
             await setFlow(pool, from, "reservas", "inicio");
-            responseText = await handleFlujoReservas(pool, from, userInput, "inicio", draft);
+            response = await handleFlujoReservas(pool, from, userInput, "inicio", draft, token, phoneNumberId);
           } else if (userInput === "2") {
             await setFlow(pool, from, "buscar_clubs", "inicio");
-            responseText = await handleFlujoBuscarClubs(pool, from, userInput, "inicio", draft);
+            response = await handleFlujoBuscarClubs(pool, from, userInput, "inicio", draft);
           } else if (userInput === "3") {
             await setFlow(pool, from, "info_club", "inicio");
-            responseText = await handleFlujoInfoClub(pool, from, userInput, "inicio", draft);
+            response = await handleFlujoInfoClub(pool, from, userInput, "inicio", draft);
           } else if (userInput === "4") {
             await setFlow(pool, from, "problemas", "inicio");
-            responseText = await handleFlujoProblemas(pool, from, userInput, "inicio", draft);
+            response = await handleFlujoProblemas(pool, from, userInput, "inicio", draft);
           } else {
-            responseText = menuPrincipal();
+            response = { type: "text", text: menuPrincipal() };
           }
         } else {
           // 4. ENRUTAR A FLUJO ESPECÍFICO
           switch (draft.flow) {
             case "reservas":
-              responseText = await handleFlujoReservas(pool, from, userInput, draft.step, draft);
+              response = await handleFlujoReservas(pool, from, userInput, draft.step, draft, token, phoneNumberId);
               break;
 
             case "buscar_clubs":
-              responseText = await handleFlujoBuscarClubs(pool, from, userInput, draft.step, draft);
+              response = await handleFlujoBuscarClubs(pool, from, userInput, draft.step, draft);
               break;
 
             case "info_club":
-              responseText = await handleFlujoInfoClub(pool, from, userInput, draft.step, draft);
+              response = await handleFlujoInfoClub(pool, from, userInput, draft.step, draft);
               break;
 
             case "problemas":
-              responseText = await handleFlujoProblemas(pool, from, userInput, draft.step, draft);
+              response = await handleFlujoProblemas(pool, from, userInput, draft.step, draft);
               break;
 
             default:
               await clearFlow(pool, from);
-              responseText = "Error: flujo no reconocido. Volviendo al menú principal.\n\n" + menuPrincipal();
+              response = { type: "text", text: "Error: flujo no reconocido. Volviendo al menú principal.\n\n" + menuPrincipal() };
           }
         }
       }
 
-      // Enviar respuesta al usuario
-      await sendWhatsAppText({
-        to: from,
-        token,
-        phoneNumberId,
-        text: responseText,
-      });
+      // Enviar respuesta al usuario según el tipo
+      if (response.type === "text") {
+        await sendWhatsAppText({
+          to: from,
+          token,
+          phoneNumberId,
+          text: response.text,
+        });
+      } else if (response.type === "list") {
+        await sendWhatsAppList({
+          to: from,
+          token,
+          phoneNumberId,
+          headerText: response.headerText,
+          bodyText: response.bodyText,
+          buttonText: response.buttonText,
+          sections: response.sections,
+        });
+      }
 
       return res.sendStatus(200);
     } catch (err) {
