@@ -38,15 +38,16 @@ Chatbot conversacional de WhatsApp que ayuda a los usuarios a:
 5. Vuelve al menú principal
 
 ### 3️⃣ Información de un Club
-**Flujo:**
+**Flujo (con lista interactiva):**
 1. Usuario selecciona opción "3"
-2. Bot pregunta: ¿Qué club te interesa?
-3. Usuario responde: "The Club"
-4. Bot muestra:
+2. Bot muestra **lista interactiva con clubes disponibles** (máximo 9 por página)
+3. Si hay más de 9 clubes, aparece opción "Ver más" para siguiente página
+4. Usuario selecciona club desde la lista
+5. Bot muestra:
    - Dirección completa
    - Número de canchas
-   - Horarios de operación
-5. Bot ofrece opciones:
+   - Horarios de operación por día
+6. Bot ofrece opciones:
    - Hacer una reservación (lleva al flujo 1 con club preseleccionado)
    - Volver al menú
 
@@ -104,7 +105,7 @@ Cada usuario tiene un registro en la tabla `user_drafts` con estructura JSON:
 |-------|-------|
 | **reservas** | inicio (lista ciudades) → seleccionar_club (lista clubs) → seleccionar_horario (lista horarios DB) → pedir_jugadores → pedir_duracion |
 | **buscar_clubs** | inicio → pedir_ubicacion |
-| **info_club** | inicio → pedir_nombre → menu_info |
+| **info_club** | inicio (lista clubes paginada) → seleccionar_club → menu_info |
 | **problemas** | inicio → seleccionar_problema → [diversos sub-pasos] |
 
 ### 📱 Listas Interactivas de WhatsApp
@@ -116,10 +117,16 @@ El chatbot utiliza **listas interactivas nativas de WhatsApp** para mejorar la e
 - El usuario toca un botón y se abre una lista seleccionable
 - No requiere escribir texto, solo tocar la opción deseada
 
-**Implementación en Reservas:**
+**Implementación:**
+
+**En Reservas:**
 - **Ciudades**: Lista con todas las ciudades disponibles en la BD
 - **Clubs**: Lista filtrada por ciudad seleccionada
-- **Horarios**: Lista dinámica con horarios disponibles según club (desde tabla `horarios_club`)
+- **Horarios**: Lista dinámica con slots de 1 hora generados desde `horarios_club`
+
+**En Información de Club:**
+- **Clubes**: Lista paginada con todos los clubes (9 por página)
+- **Opción "Ver más"**: Si hay más de 9 clubes, permite navegar a siguiente página
 
 **Formato técnico:**
 ```json

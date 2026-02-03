@@ -337,57 +337,71 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
 
   // PASO 3: Capturar club y mostrar horarios disponibles
   if (currentStep === "seleccionar_club") {
-    const clubs = await getDraftData(pool, phoneNumber, "clubs_disponibles");
     let clubSeleccionado = null;
 
-    // Si viene de lista interactiva
-    if (userInput.startsWith("club_")) {
-      const index = parseInt(userInput.split("_")[1]);
-      if (index >= 0 && index < clubs.length) {
-        clubSeleccionado = clubs[index];
-      }
-    }
-
-    if (!clubSeleccionado) {
-      return {
-        type: "text",
-        text: "❌ Selección inválida. Por favor selecciona un club de la lista.",
+    // Verificar si viene con club preseleccionado desde info_club
+    if (userInput.startsWith("club_preseleccionado_")) {
+      const clubId = parseInt(userInput.split("_")[2]);
+      const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
+      clubSeleccionado = {
+        id_fraccionamientoclub: clubId,
+        fc_nombre: clubNombre
       };
+    } else {
+      // Flujo normal: selección desde lista
+      const clubs = await getDraftData(pool, phoneNumber, "clubs_disponibles");
+
+      // Si viene de lista interactiva
+      if (userInput.startsWith("club_")) {
+        const index = parseInt(userInput.split("_")[1]);
+        if (index >= 0 && index < clubs.length) {
+          clubSeleccionado = clubs[index];
+        }
+      }
+
+      if (!clubSeleccionado) {
+        return {
+          type: "text",
+          text: "❌ Selección inválida. Por favor selecciona un club de la lista.",
+        };
+      }
     }
 
     // Guardar club seleccionado
     await saveDraftData(pool, phoneNumber, "club_id", clubSeleccionado.id_fraccionamientoclub);
     await saveDraftData(pool, phoneNumber, "club_nombre", clubSeleccionado.fc_nombre);
 
-    // Obtener horarios disponibles del club para hoy (DEMO - simplificado)
-    const [horarios] = await pool.query(
-      `SELECT DISTINCT hora_inicio, hora_fin 
-       FROM horarios_club 
-       WHERE id_fraccionamientoclub = ? AND estatus = 1
-       ORDER BY hora_inicio
-       LIMIT 10`,
-      [clubSeleccionado.id_fraccionamientoclub]
-    );
+    // DEMO: Generar horarios simulados (sin consultar BD)
+    const slots = [
+      { inicio: "08:00", fin: "09:00" },
+      { inicio: "09:00", fin: "10:00" },
+      { inicio: "10:00", fin: "11:00" },
+      { inicio: "11:00", fin: "12:00" },
+      { inicio: "12:00", fin: "13:00" },
+      { inicio: "13:00", fin: "14:00" },
+      { inicio: "14:00", fin: "15:00" },
+      { inicio: "15:00", fin: "16:00" },
+      { inicio: "16:00", fin: "17:00" },
+      { inicio: "17:00", fin: "18:00" },
+      { inicio: "18:00", fin: "19:00" },
+      { inicio: "19:00", fin: "20:00" },
+      { inicio: "20:00", fin: "21:00" },
+      { inicio: "21:00", fin: "22:00" },
+      { inicio: "22:00", fin: "23:00" },
+    ];
 
-    if (horarios.length === 0) {
-      await clearFlow(pool, phoneNumber);
-      return {
-        type: "text",
-        text: `❌ No hay horarios disponibles para *${clubSeleccionado.fc_nombre}*.\n\n${menuPrincipal()}`,
-      };
-    }
-
-    await saveDraftData(pool, phoneNumber, "horarios_disponibles", horarios);
+    // Limitar a máximo 24 slots (límite de WhatsApp)
+    const slotsLimitados = slots.slice(0, 24);
+    
+    await saveDraftData(pool, phoneNumber, "horarios_disponibles", slotsLimitados);
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_horario");
 
     // Crear lista interactiva de horarios
-    const rows = horarios.map((h, idx) => {
-      const inicio = h.hora_inicio.substring(0, 5);
-      const fin = h.hora_fin.substring(0, 5);
+    const rows = slotsLimitados.map((slot, idx) => {
       return {
         id: `horario_${idx}`,
-        title: `${inicio} - ${fin}`,
-        description: `Disponible en ${clubSeleccionado.fc_nombre}`,
+        title: `${slot.inicio} - ${slot.fin}`,
+        description: `Disponible`,
       };
     });
 
@@ -425,13 +439,13 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
       };
     }
 
-    const horaInicio = horarioSeleccionado.hora_inicio.substring(0, 5);
-    await saveDraftData(pool, phoneNumber, "horario", horaInicio);
+    const horarioDisplay = `${horarioSeleccionado.inicio} - ${horarioSeleccionado.fin}`;
+    await saveDraftData(pool, phoneNumber, "horario", horarioDisplay);
     await setFlow(pool, phoneNumber, "reservas", "pedir_jugadores");
 
     return {
       type: "text",
-      text: `Perfecto, has seleccionado el horario *${horaInicio}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)`,
+      text: `Perfecto, has seleccionado el horario *${horarioDisplay}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)`,
     };
   }
 
@@ -535,39 +549,111 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
 /**
  * Flujo 3: Información de un Club
  */
-async function handleFlujoInfoClub(pool, phoneNumber, userInput, currentStep, draft) {
-  // PASO 1: Pedir nombre del club
+async function handleFlujoInfoClub(pool, phoneNumber, userInput, currentStep, draft, token, phoneNumberId) {
+  // PASO 1: Mostrar lista de clubes disponibles
   if (currentStep === "inicio") {
-    await setFlow(pool, phoneNumber, "info_club", "pedir_nombre");
-    return {
-      type: "text",
-      text: "¿Qué club te interesa? Escribe el nombre del club.",
-    };
-  }
+    // Obtener página actual (default: 0)
+    const offset = (await getDraftData(pool, phoneNumber, "clubs_offset")) || 0;
+    const limit = 9;
 
-  // PASO 2: Buscar información del club
-  if (currentStep === "pedir_nombre") {
-    // Buscar club por nombre (DEMO)
+    // Consultar todos los clubes disponibles
     const [clubs] = await pool.query(
       `SELECT fc.id_fraccionamientoclub, fc.fc_nombre, 
-              d.calle, d.num_ext, d.colonia, d.cp, d.estado,
-              (SELECT COUNT(*) FROM canchas c WHERE c.id_fraccionamientoclub = fc.id_fraccionamientoclub AND c.id_status = 1) as num_canchas
+              d.estado, d.colonia
        FROM fraccionamiento_club fc
        INNER JOIN direccion d ON fc.id_direccion = d.id_direccion
-       WHERE fc.fc_nombre LIKE ? AND fc.id_status = 1
-       LIMIT 1`,
-      [`%${userInput}%`]
+       WHERE fc.id_status = 1
+       ORDER BY fc.fc_nombre
+       LIMIT ? OFFSET ?`,
+      [limit + 1, offset] // +1 para saber si hay más
     );
 
     if (clubs.length === 0) {
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: `❌ No encontré información sobre *${userInput}*.
-
-${menuPrincipal()}`,
+        text: `❌ No hay clubes disponibles en este momento.\n\n${menuPrincipal()}`,
       };
     }
+
+    const hayMas = clubs.length > limit;
+    const clubsMostrar = clubs.slice(0, limit);
+
+    await saveDraftData(pool, phoneNumber, "clubs_lista", clubsMostrar);
+    await setFlow(pool, phoneNumber, "info_club", "seleccionar_club");
+
+    // Crear filas para la lista
+    const rows = clubsMostrar.map((club, idx) => ({
+      id: `club_info_${idx}`,
+      title: club.fc_nombre.substring(0, 24), // Max 24 caracteres
+      description: `📍 ${club.colonia}, ${club.estado}`.substring(0, 72),
+    }));
+
+    // Agregar opción "Ver más" si hay más clubes
+    if (hayMas) {
+      rows.push({
+        id: "ver_mas_clubs",
+        title: "Ver más clubes",
+        description: "Mostrar siguientes 9 clubes",
+      });
+    }
+
+    return {
+      type: "list",
+      headerText: "🎾 Clubes Disponibles",
+      bodyText: "Selecciona el club del que deseas ver información:",
+      buttonText: "Ver clubes",
+      sections: [
+        {
+          title: "Clubes",
+          rows: rows,
+        },
+      ],
+    };
+  }
+
+  // PASO 2: Procesar selección de club o paginación
+  if (currentStep === "seleccionar_club") {
+    // Si seleccionó "Ver más"
+    if (userInput === "ver_mas_clubs") {
+      const offset = (await getDraftData(pool, phoneNumber, "clubs_offset")) || 0;
+      await saveDraftData(pool, phoneNumber, "clubs_offset", offset + 9);
+      await setFlow(pool, phoneNumber, "info_club", "inicio");
+      
+      // Recursivamente llamar a inicio para mostrar siguiente página
+      return await handleFlujoInfoClub(pool, phoneNumber, userInput, "inicio", draft);
+    }
+
+    // Extraer índice del club seleccionado
+    if (!userInput.startsWith("club_info_")) {
+      return {
+        type: "text",
+        text: "❌ Selección inválida. Por favor elige un club de la lista.",
+      };
+    }
+
+    const index = parseInt(userInput.split("_")[2]);
+    const clubsLista = await getDraftData(pool, phoneNumber, "clubs_lista");
+
+    if (index < 0 || index >= clubsLista.length) {
+      return {
+        type: "text",
+        text: "❌ Selección inválida. Por favor elige un club de la lista.",
+      };
+    }
+
+    const clubSeleccionado = clubsLista[index];
+
+    // Obtener información completa del club
+    const [clubs] = await pool.query(
+      `SELECT fc.id_fraccionamientoclub, fc.fc_nombre, 
+              d.calle, d.num_ext, d.colonia, d.cp, d.estado,
+              (SELECT COUNT(*) FROM canchas c WHERE c.id_fraccionamientoclub = fc.id_fraccionamientoclub AND c.id_status = 1) as num_canchas
+       FROM fraccionamiento_club fc
+       INNER JOIN direccion d ON fc.id_direccion = d.id_direccion
+       WHERE fc.id_fraccionamientoclub = ?`,
+      [clubSeleccionado.id_fraccionamientoclub]
+    );
 
     const club = clubs[0];
 
@@ -581,24 +667,25 @@ ${menuPrincipal()}`,
     );
 
     await saveDraftData(pool, phoneNumber, "club_info", club);
+    await saveDraftData(pool, phoneNumber, "clubs_offset", 0); // Reset offset
     await setFlow(pool, phoneNumber, "info_club", "menu_info");
 
-    let response = `🎾 *${club.fc_nombre}* 🎾\n\n`;
-    response += `📍 *Ubicación:*\n${club.calle} ${club.num_ext}, ${club.colonia}\nCP ${club.cp}, ${club.estado}\n\n`;
-    response += `🏟️ *Canchas disponibles:* ${club.num_canchas}\n\n`;
+    let text = `🎾 *${club.fc_nombre}* 🎾\n\n`;
+    text += `📍 *Ubicación:*\n${club.calle || 'N/A'} ${club.num_ext || ''}, ${club.colonia || 'N/A'}\nCP ${club.cp || 'N/A'}, ${club.estado || 'N/A'}\n\n`;
+    text += `🏟️ *Canchas disponibles:* ${club.num_canchas || 0}\n\n`;
     
     if (horarios.length > 0) {
-      response += `⏰ *Horarios:*\n`;
+      text += `⏰ *Horarios:*\n`;
       horarios.forEach(h => {
-        response += `   ${h.dia}: ${h.hora_inicio.substring(0, 5)} - ${h.hora_fin.substring(0, 5)}\n`;
+        text += `   ${h.dia}: ${h.hora_inicio.substring(0, 5)} - ${h.hora_fin.substring(0, 5)}\n`;
       });
     }
 
-    response += `\n¿Qué deseas saber más?\n\n`;
-    response += `1️⃣ Hacer una reservación\n`;
-    response += `2️⃣ Volver al menú principal\n`;
+    text += `\n¿Qué deseas hacer?\n\n`;
+    text += `1️⃣ Hacer una reservación\n`;
+    text += `2️⃣ Volver al menú principal\n`;
 
-    return response;
+    return { type: "text", text };
   }
 
   // PASO 3: Menú de opciones
@@ -608,9 +695,20 @@ ${menuPrincipal()}`,
       const clubInfo = await getDraftData(pool, phoneNumber, "club_info");
       await saveDraftData(pool, phoneNumber, "club_id", clubInfo.id_fraccionamientoclub);
       await saveDraftData(pool, phoneNumber, "club_nombre", clubInfo.fc_nombre);
-      await setFlow(pool, phoneNumber, "reservas", "pedir_jugadores");
       
-      return { type: "text", text: `Perfecto, reservaremos en *${clubInfo.fc_nombre}*.\n\n¿Para cuántas personas será la reserva? (Ejemplo: 4 jugadores)` };
+      // Cambiar a flujo de reservas y mostrar horarios directamente
+      await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
+      
+      // Simular que viene desde seleccionar_club con el club ya elegido
+      // Llamar recursivamente al flujo de reservas con un input especial
+      return await handleFlujoReservas(pool, phoneNumber, `club_preseleccionado_${clubInfo.id_fraccionamientoclub}`, "seleccionar_club", {
+        ...draft,
+        data: {
+          ...draft.data,
+          club_id: clubInfo.id_fraccionamientoclub,
+          club_nombre: clubInfo.fc_nombre
+        }
+      }, token, phoneNumberId);
     } else if (userInput === "2") {
       await clearFlow(pool, phoneNumber);
       return { type: "text", text: menuPrincipal() };
@@ -821,7 +919,7 @@ export const whatsappWebhookPadel = onRequest(
             response = await handleFlujoBuscarClubs(pool, from, userInput, "inicio", draft);
           } else if (userInput === "3") {
             await setFlow(pool, from, "info_club", "inicio");
-            response = await handleFlujoInfoClub(pool, from, userInput, "inicio", draft);
+            response = await handleFlujoInfoClub(pool, from, userInput, "inicio", draft, token, phoneNumberId);
           } else if (userInput === "4") {
             await setFlow(pool, from, "problemas", "inicio");
             response = await handleFlujoProblemas(pool, from, userInput, "inicio", draft);
@@ -840,7 +938,7 @@ export const whatsappWebhookPadel = onRequest(
               break;
 
             case "info_club":
-              response = await handleFlujoInfoClub(pool, from, userInput, draft.step, draft);
+              response = await handleFlujoInfoClub(pool, from, userInput, draft.step, draft, token, phoneNumberId);
               break;
 
             case "problemas":
