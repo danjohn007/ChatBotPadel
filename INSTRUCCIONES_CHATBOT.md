@@ -1,4 +1,4 @@
-# 🤖 Chatbot de Soporte Técnico - AroSport Padel
+# 🤖 Chatbot de Soporte Técnico - ArosPorts Padel
 
 ## 📋 Descripción
 
@@ -186,7 +186,7 @@ firebase deploy --only functions
 
 ```
 Usuario: Hola
-Bot: 🎾 Bienvenido a AroSport Padel 🎾
+Bot: 🎾 Bienvenido a ArosPorts Padel 🎾
      ¿En qué puedo ayudarte hoy?
      1️⃣ Reservar cancha
      2️⃣ Buscar clubs cercanos
