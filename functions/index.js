@@ -1968,6 +1968,10 @@ export const whatsappWebhookPadel = onRequest(
               response = await handleFlujoSoporte(pool, from, userInput, draft.step, draft, token, phoneNumberId);
               break;
 
+            case "soporte":
+              response = await handleFlujoSoporte(pool, from, userInput, draft.step, draft, token, phoneNumberId);
+              break;
+
             default:
               await clearFlow(pool, from);
               response = { type: "text", text: "Error: flujo no reconocido. Volviendo al menú principal." + textoVolverMenu() };
