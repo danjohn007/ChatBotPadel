@@ -841,48 +841,295 @@ ${menuPrincipal()}`,
 }
 
 /**
- * Flujo 2: Buscar Clubs Cercanos
+ * Flujo 2: Buscar Clubs (Menú → Texto / Estado / Ubicación)
  */
 async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep, draft) {
-  // PASO 1: Mostrar lista de ciudades disponibles con paginación
+  // PASO 0: Mostrar menú de opciones de búsqueda
   if (currentStep === "inicio") {
-    // Obtener página actual (default: 0)
-    const offset = (await getDraftData(pool, phoneNumber, "ciudades_offset")) || 0;
+    await setFlow(pool, phoneNumber, "buscar_clubs", "menu_busqueda");
+    return {
+      type: "button",
+      headerText: "📍 Buscar Clubs",
+      bodyText: "¿Cómo quieres buscar clubs?\n\n🔍 *Buscar por nombre* - Escribe el nombre del club, ciudad o estado\n📋 *Navegar por estado* - Explora la lista completa\n📍 *Enviar ubicación* - Encuentra clubs cerca de ti",
+      buttons: [
+        { type: "reply", reply: { id: "buscar_texto", title: "🔍 Buscar por nombre" } },
+        { type: "reply", reply: { id: "buscar_estado", title: "📋 Por estado" } },
+        { type: "reply", reply: { id: "buscar_ubicacion", title: "📍 Mi ubicación" } },
+      ],
+    };
+  }
+
+  // MENÚ: Procesar selección del tipo de búsqueda
+  if (currentStep === "menu_busqueda") {
+    if (userInput === "buscar_texto") {
+      await setFlow(pool, phoneNumber, "buscar_clubs", "escribir_busqueda");
+      return {
+        type: "text",
+        text: "🔍 *Buscar club*\n\nEscribe el nombre del club, ciudad o estado que buscas.\n\n_Ejemplo: \"Querétaro\", \"Padel Courts\", \"Jalisco\"_",
+      };
+    }
+    if (userInput === "buscar_estado") {
+      await setFlow(pool, phoneNumber, "buscar_clubs", "listar_estados");
+      return await handleFlujoBuscarClubs(pool, phoneNumber, userInput, "listar_estados", draft);
+    }
+    if (userInput === "buscar_ubicacion") {
+      await setFlow(pool, phoneNumber, "buscar_clubs", "esperar_ubicacion");
+      return {
+        type: "text",
+        text: "📍 *Enviar ubicación*\n\nEnvía tu ubicación actual para encontrar clubs cerca de ti.\n\n_Toca el clip 📎 → Ubicación → Enviar ubicación actual_",
+      };
+    }
+    // Si no reconoce la opción, volver a mostrar menú
+    await setFlow(pool, phoneNumber, "buscar_clubs", "inicio");
+    return await handleFlujoBuscarClubs(pool, phoneNumber, userInput, "inicio", draft);
+  }
+
+  // BÚSQUEDA POR TEXTO: Usuario escribe término de búsqueda
+  if (currentStep === "escribir_busqueda") {
+    const termino = userInput.trim();
+    if (termino.length < 2) {
+      return {
+        type: "text",
+        text: "❌ Escribe al menos 2 caracteres para buscar.",
+      };
+    }
+
+    const busqueda = `%${termino}%`;
+    const [clubs] = await pool.query(
+      `SELECT nombre, direccion, telefonos, ciudad, estado 
+       FROM directorio_clubes 
+       WHERE nombre LIKE ? OR ciudad LIKE ? OR estado LIKE ?
+       ORDER BY estado ASC, ciudad ASC, nombre ASC
+       LIMIT 15`,
+      [busqueda, busqueda, busqueda]
+    );
+
+    await clearFlow(pool, phoneNumber);
+
+    if (clubs.length === 0) {
+      return {
+        type: "text",
+        text: `❌ No encontré clubs con *"${termino}"*.\n\nIntenta con otro nombre, ciudad o estado.${textoVolverMenu()}`,
+      };
+    }
+
+    let text = `🔍 *Resultados para "${termino}"*\n\n`;
+    text += `Encontré *${clubs.length}* club${clubs.length > 1 ? 's' : ''}${clubs.length === 15 ? ' (mostrando los primeros 15)' : ''}:\n\n`;
+
+    clubs.forEach((club, idx) => {
+      text += `${idx + 1}️⃣ *${club.nombre}*\n`;
+      text += `   📍 ${club.ciudad}, ${club.estado}\n`;
+      if (club.direccion) {
+        text += `   🏠 ${club.direccion}\n`;
+      }
+      if (club.telefonos) {
+        try {
+          const telefonos = JSON.parse(club.telefonos);
+          if (telefonos.length > 0) {
+            text += `   📞 ${telefonos.join(', ')}\n`;
+          }
+        } catch (e) {}
+      }
+      text += `\n`;
+    });
+
+    text += textoVolverMenu();
+    return { type: "text", text };
+  }
+
+  // BÚSQUEDA POR UBICACIÓN: Procesada desde el webhook cuando llega un msg tipo location
+  if (currentStep === "esperar_ubicacion") {
+    // Si el usuario envió texto en vez de ubicación
+    return {
+      type: "text",
+      text: "📍 Por favor envía tu *ubicación actual*, no texto.\n\n_Toca el clip 📎 → Ubicación → Enviar ubicación actual_",
+    };
+  }
+
+  // RESULTADO DE UBICACIÓN: Mostrar clubs encontrados por cercanía
+  if (currentStep === "resultado_ubicacion") {
+    // Este paso se llama directamente desde el webhook con userInput = estado encontrado
+    const estadoCercano = await getDraftData(pool, phoneNumber, "estado_ubicacion");
+    const ciudadCercana = await getDraftData(pool, phoneNumber, "ciudad_ubicacion");
+
+    let clubs;
+    if (ciudadCercana) {
+      [clubs] = await pool.query(
+        `SELECT nombre, direccion, telefonos, ciudad, estado 
+         FROM directorio_clubes 
+         WHERE ciudad = ?
+         ORDER BY nombre ASC
+         LIMIT 15`,
+        [ciudadCercana]
+      );
+    }
+
+    if (!clubs || clubs.length === 0) {
+      [clubs] = await pool.query(
+        `SELECT nombre, direccion, telefonos, ciudad, estado 
+         FROM directorio_clubes 
+         WHERE estado = ?
+         ORDER BY ciudad ASC, nombre ASC
+         LIMIT 15`,
+        [estadoCercano]
+      );
+    }
+
+    await clearFlow(pool, phoneNumber);
+
+    if (!clubs || clubs.length === 0) {
+      return {
+        type: "text",
+        text: `❌ No encontré clubs cerca de tu ubicación.\n\nIntenta buscar por nombre o navegar por estado.${textoVolverMenu()}`,
+      };
+    }
+
+    let text = `📍 *Clubs cerca de ti*\n`;
+    text += ciudadCercana ? `_${ciudadCercana}, ${estadoCercano}_\n\n` : `_${estadoCercano}_\n\n`;
+    text += `Encontré *${clubs.length}* club${clubs.length > 1 ? 's' : ''}:\n\n`;
+
+    clubs.forEach((club, idx) => {
+      text += `${idx + 1}️⃣ *${club.nombre}*\n`;
+      text += `   📍 ${club.ciudad}, ${club.estado}\n`;
+      if (club.direccion) {
+        text += `   🏠 ${club.direccion}\n`;
+      }
+      if (club.telefonos) {
+        try {
+          const telefonos = JSON.parse(club.telefonos);
+          if (telefonos.length > 0) {
+            text += `   📞 ${telefonos.join(', ')}\n`;
+          }
+        } catch (e) {}
+      }
+      text += `\n`;
+    });
+
+    text += textoVolverMenu();
+    return { type: "text", text };
+  }
+
+  // LISTAR ESTADOS con paginación
+  if (currentStep === "listar_estados") {
+    const offset = (await getDraftData(pool, phoneNumber, "estados_offset")) || 0;
     const limit = 9; // Máximo 9 + 1 para "Ver más" = 10 items (límite de WhatsApp)
 
-    // Obtener ciudades únicas desde directorio_clubes
-    const [ciudades] = await pool.query(
-      `SELECT DISTINCT ciudad 
+    // Obtener estados únicos desde directorio_clubes
+    const [estados] = await pool.query(
+      `SELECT DISTINCT estado, COUNT(DISTINCT ciudad) as num_ciudades
        FROM directorio_clubes 
-       WHERE ciudad IS NOT NULL AND ciudad != '' 
+       WHERE estado IS NOT NULL AND estado != '' 
+       GROUP BY estado
+       ORDER BY estado ASC 
+       LIMIT ? OFFSET ?`,
+      [limit + 1, offset]
+    );
+
+    if (estados.length === 0) {
+      await clearFlow(pool, phoneNumber);
+      return {
+        type: "text",
+        text: `❌ No hay estados disponibles en el directorio.${textoVolverMenu()}`,
+      };
+    }
+
+    const hayMas = estados.length > limit;
+    const estadosMostrar = estados.slice(0, limit);
+
+    await saveDraftData(pool, phoneNumber, "estados_lista", estadosMostrar);
+    await setFlow(pool, phoneNumber, "buscar_clubs", "seleccionar_estado");
+
+    const rows = estadosMostrar.map((e, idx) => ({
+      id: `estado_buscar_${idx}`,
+      title: e.estado.substring(0, 24),
+      description: `${e.num_ciudades} ciudad${e.num_ciudades > 1 ? 'es' : ''}`,
+    }));
+
+    if (hayMas) {
+      rows.push({
+        id: "ver_mas_estados",
+        title: "Ver más estados",
+        description: "Mostrar siguientes 9 estados",
+      });
+    }
+
+    return {
+      type: "list",
+      headerText: "📍 Buscar Clubs",
+      bodyText: `Selecciona el estado donde deseas buscar clubs:\n\n_Mostrando estados ${offset + 1}-${offset + estadosMostrar.length}_`,
+      buttonText: "Ver estados",
+      sections: [
+        {
+          title: "Estados Disponibles",
+          rows: rows,
+        },
+      ],
+    };
+  }
+
+  // PASO 2: Usuario selecciona estado → mostrar ciudades de ese estado
+  if (currentStep === "seleccionar_estado") {
+    if (userInput === "ver_mas_estados") {
+      const offset = (await getDraftData(pool, phoneNumber, "estados_offset")) || 0;
+      await saveDraftData(pool, phoneNumber, "estados_offset", offset + 9);
+      await setFlow(pool, phoneNumber, "buscar_clubs", "listar_estados");
+      return await handleFlujoBuscarClubs(pool, phoneNumber, userInput, "listar_estados", draft);
+    }
+
+    const estados = await getDraftData(pool, phoneNumber, "estados_lista");
+
+    let estadoSeleccionado = null;
+    if (userInput.startsWith("estado_buscar_")) {
+      const index = parseInt(userInput.replace("estado_buscar_", ""));
+      if (!isNaN(index) && estados && estados[index]) {
+        estadoSeleccionado = estados[index].estado;
+      }
+    }
+
+    if (!estadoSeleccionado) {
+      return {
+        type: "text",
+        text: `❌ Opción inválida. Por favor selecciona un estado de la lista.`,
+      };
+    }
+
+    await saveDraftData(pool, phoneNumber, "estado_seleccionado", estadoSeleccionado);
+
+    // Obtener ciudades del estado seleccionado
+    const offset = 0;
+    await saveDraftData(pool, phoneNumber, "ciudades_offset", offset);
+    const limit = 9;
+
+    const [ciudades] = await pool.query(
+      `SELECT DISTINCT ciudad, COUNT(*) as num_clubs
+       FROM directorio_clubes 
+       WHERE estado = ?
+       GROUP BY ciudad
        ORDER BY ciudad ASC 
        LIMIT ? OFFSET ?`,
-      [limit + 1, offset] // +1 para saber si hay más
+      [estadoSeleccionado, limit + 1, offset]
     );
 
     if (ciudades.length === 0) {
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: `❌ No hay ciudades disponibles en el directorio.${textoVolverMenu()}`,
+        text: `❌ No hay ciudades disponibles en *${estadoSeleccionado}*.${textoVolverMenu()}`,
       };
     }
 
     const hayMas = ciudades.length > limit;
     const ciudadesMostrar = ciudades.slice(0, limit);
 
-    // Guardar ciudades en el draft
     await saveDraftData(pool, phoneNumber, "ciudades_lista", ciudadesMostrar);
     await setFlow(pool, phoneNumber, "buscar_clubs", "seleccionar_ciudad");
 
-    // Crear filas para la lista (máximo 9 ciudades + 1 "Ver más")
     const rows = ciudadesMostrar.map((c, idx) => ({
       id: `ciudad_buscar_${idx}`,
-      title: c.ciudad,
-      description: `Clubs en ${c.ciudad}`,
+      title: c.ciudad.substring(0, 24),
+      description: `${c.num_clubs} club${c.num_clubs > 1 ? 's' : ''}`,
     }));
 
-    // Agregar opción "Ver más" si hay más ciudades
     if (hayMas) {
       rows.push({
         id: "ver_mas_ciudades",
@@ -893,7 +1140,7 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
 
     return {
       type: "list",
-      headerText: "📍 Buscar Clubs",
+      headerText: `📍 ${estadoSeleccionado}`,
       bodyText: `Selecciona la ciudad donde deseas buscar clubs:\n\n_Mostrando ciudades ${offset + 1}-${offset + ciudadesMostrar.length}_`,
       buttonText: "Ver ciudades",
       sections: [
@@ -905,19 +1152,69 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
     };
   }
 
-  // PASO 2: Usuario selecciona ciudad o pide ver más
+  // PASO 3: Usuario selecciona ciudad → mostrar clubs
   if (currentStep === "seleccionar_ciudad") {
-    // Si selecciona "Ver más ciudades"
     if (userInput === "ver_mas_ciudades") {
       const offset = (await getDraftData(pool, phoneNumber, "ciudades_offset")) || 0;
       await saveDraftData(pool, phoneNumber, "ciudades_offset", offset + 9);
-      await setFlow(pool, phoneNumber, "buscar_clubs", "inicio");
-      return await handleFlujoBuscarClubs(pool, phoneNumber, userInput, "inicio", draft);
+
+      const estadoSeleccionado = await getDraftData(pool, phoneNumber, "estado_seleccionado");
+      const newOffset = offset + 9;
+      const limit = 9;
+
+      const [ciudades] = await pool.query(
+        `SELECT DISTINCT ciudad, COUNT(*) as num_clubs
+         FROM directorio_clubes 
+         WHERE estado = ?
+         GROUP BY ciudad
+         ORDER BY ciudad ASC 
+         LIMIT ? OFFSET ?`,
+        [estadoSeleccionado, limit + 1, newOffset]
+      );
+
+      if (ciudades.length === 0) {
+        return {
+          type: "text",
+          text: `❌ No hay más ciudades disponibles.${textoVolverMenu()}`,
+        };
+      }
+
+      const hayMas = ciudades.length > limit;
+      const ciudadesMostrar = ciudades.slice(0, limit);
+
+      await saveDraftData(pool, phoneNumber, "ciudades_lista", ciudadesMostrar);
+      await setFlow(pool, phoneNumber, "buscar_clubs", "seleccionar_ciudad");
+
+      const rows = ciudadesMostrar.map((c, idx) => ({
+        id: `ciudad_buscar_${idx}`,
+        title: c.ciudad.substring(0, 24),
+        description: `${c.num_clubs} club${c.num_clubs > 1 ? 's' : ''}`,
+      }));
+
+      if (hayMas) {
+        rows.push({
+          id: "ver_mas_ciudades",
+          title: "Ver más ciudades",
+          description: "Mostrar siguientes 9 ciudades",
+        });
+      }
+
+      return {
+        type: "list",
+        headerText: `📍 ${estadoSeleccionado}`,
+        bodyText: `Selecciona la ciudad donde deseas buscar clubs:\n\n_Mostrando ciudades ${newOffset + 1}-${newOffset + ciudadesMostrar.length}_`,
+        buttonText: "Ver ciudades",
+        sections: [
+          {
+            title: "Ciudades Disponibles",
+            rows: rows,
+          },
+        ],
+      };
     }
 
     const ciudades = await getDraftData(pool, phoneNumber, "ciudades_lista");
     
-    // Buscar por ID de lista interactiva
     let ciudadSeleccionada = null;
     if (userInput.startsWith("ciudad_buscar_")) {
       const index = parseInt(userInput.replace("ciudad_buscar_", ""));
@@ -934,12 +1231,13 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
     }
 
     // Buscar clubs en la ciudad seleccionada
+    const estadoSeleccionado = await getDraftData(pool, phoneNumber, "estado_seleccionado");
     const [clubs] = await pool.query(
       `SELECT nombre, direccion, telefonos, ciudad 
        FROM directorio_clubes 
-       WHERE ciudad = ? 
+       WHERE ciudad = ? AND estado = ?
        ORDER BY nombre ASC`,
-      [ciudadSeleccionada]
+      [ciudadSeleccionada, estadoSeleccionado]
     );
 
     await clearFlow(pool, phoneNumber);
@@ -951,7 +1249,7 @@ async function handleFlujoBuscarClubs(pool, phoneNumber, userInput, currentStep,
       };
     }
 
-    let text = `🎾 *Clubs en ${ciudadSeleccionada}*\n\n`;
+    let text = `🎾 *Clubs en ${ciudadSeleccionada}, ${estadoSeleccionado}*\n\n`;
     text += `Encontré *${clubs.length}* club${clubs.length > 1 ? 's' : ''}:\n\n`;
     
     clubs.forEach((club, idx) => {
@@ -1767,7 +2065,108 @@ ${textoVolverMenu()}`,
 }
 
 // =========================================================
-// 🚀 WEBHOOK PRINCIPAL - CHATBOT
+// � COORDENADAS DE CIUDADES CONOCIDAS PARA BÚSQUEDA POR UBICACIÓN
+// =========================================================
+const CIUDADES_COORDENADAS = [
+  { ciudad: "Querétaro", estado: "Querétaro", lat: 20.5888, lng: -100.3899 },
+  { ciudad: "San Miguel de Allende", estado: "Guanajuato", lat: 20.9144, lng: -100.7452 },
+  { ciudad: "Leon", estado: "Guanajuato", lat: 21.1250, lng: -101.6859 },
+  { ciudad: "Celaya", estado: "Guanajuato", lat: 20.5236, lng: -100.8157 },
+  { ciudad: "Guanajuato", estado: "Guanajuato", lat: 21.0190, lng: -101.2574 },
+  { ciudad: "Irapuato/Salamanca", estado: "Guanajuato", lat: 20.6766, lng: -101.3555 },
+  { ciudad: "CDMX/Edo de Mex", estado: "CDMX/Edo de México", lat: 19.4326, lng: -99.1332 },
+  { ciudad: "Toluca", estado: "CDMX/Edo de México", lat: 19.2826, lng: -99.6557 },
+  { ciudad: "Valle de Bravo", estado: "Estado de México", lat: 19.1925, lng: -100.1314 },
+  { ciudad: "Monterrey", estado: "Nuevo León", lat: 25.6866, lng: -100.3161 },
+  { ciudad: "Guadalajara", estado: "Jalisco", lat: 20.6597, lng: -103.3496 },
+  { ciudad: "Puebla/Tlaxcala", estado: "Puebla", lat: 19.0414, lng: -98.2063 },
+  { ciudad: "Cuernavaca", estado: "Morelos", lat: 18.9242, lng: -99.2216 },
+  { ciudad: "Pachuca", estado: "Hidalgo", lat: 20.1011, lng: -98.7591 },
+  { ciudad: "Veracruz", estado: "Veracruz", lat: 19.1738, lng: -96.1342 },
+  { ciudad: "Mérida", estado: "Yucatán", lat: 20.9674, lng: -89.5926 },
+  { ciudad: "Tijuana", estado: "Baja California", lat: 32.5149, lng: -117.0382 },
+  { ciudad: "Ensenada", estado: "Baja California", lat: 31.8667, lng: -116.5964 },
+  { ciudad: "Mexicali", estado: "Baja California", lat: 32.6246, lng: -115.4523 },
+  { ciudad: "Riviera Maya", estado: "Quintana Roo", lat: 20.6296, lng: -87.0739 },
+  { ciudad: "Los Cabos", estado: "Baja California Sur", lat: 22.8905, lng: -109.9167 },
+  { ciudad: "Chihuahua", estado: "Chihuahua", lat: 28.6353, lng: -106.0889 },
+  { ciudad: "Ciudad Juarez", estado: "Chihuahua", lat: 31.6904, lng: -106.4245 },
+  { ciudad: "Mazatlán", estado: "Sinaloa", lat: 23.2494, lng: -106.4111 },
+  { ciudad: "Riviera Nayarit", estado: "Jalisco/Nayarit", lat: 20.6534, lng: -105.2253 },
+  { ciudad: "Morelia", estado: "Michoacán", lat: 19.7060, lng: -101.1950 },
+  { ciudad: "Moroleón/Uruapan", estado: "Michoacán", lat: 20.1276, lng: -101.1901 },
+  { ciudad: "La Piedad", estado: "Michoacán", lat: 20.3439, lng: -102.0255 },
+  { ciudad: "San Luis Potosi", estado: "San Luis Potosí", lat: 22.1565, lng: -100.9855 },
+  { ciudad: "Oaxaca", estado: "Oaxaca", lat: 17.0732, lng: -96.7266 },
+  { ciudad: "Saltillo", estado: "Coahuila", lat: 25.4232, lng: -100.9924 },
+  { ciudad: "Torreon", estado: "Coahuila", lat: 25.5428, lng: -103.4068 },
+  { ciudad: "Piedras Negras", estado: "Coahuila", lat: 28.7010, lng: -100.5218 },
+  { ciudad: "Chiapas", estado: "Chiapas", lat: 16.7528, lng: -93.1152 },
+  { ciudad: "Hermosillo", estado: "Sonora", lat: 29.0729, lng: -110.9559 },
+  { ciudad: "Tampico", estado: "Tamaulipas", lat: 22.2331, lng: -97.8613 },
+  { ciudad: "Matamoros", estado: "Tamaulipas", lat: 25.8697, lng: -97.5027 },
+  { ciudad: "Durango", estado: "Durango", lat: 24.0277, lng: -104.6532 },
+  { ciudad: "Aguascalientes", estado: "Aguascalientes", lat: 21.8853, lng: -102.2916 },
+];
+
+/**
+ * Calcula distancia entre dos puntos geográficos (fórmula de Haversine simplificada)
+ */
+function distanciaEntre(lat1, lng1, lat2, lng2) {
+  const dLat = lat2 - lat1;
+  const dLng = lng2 - lng1;
+  return Math.sqrt(dLat * dLat + dLng * dLng);
+}
+
+/**
+ * Encuentra la ciudad más cercana a las coordenadas dadas
+ */
+function encontrarCiudadCercana(lat, lng) {
+  if (!lat || !lng) return null;
+  
+  let mejorMatch = null;
+  let menorDistancia = Infinity;
+
+  for (const ciudad of CIUDADES_COORDENADAS) {
+    const dist = distanciaEntre(lat, lng, ciudad.lat, ciudad.lng);
+    if (dist < menorDistancia) {
+      menorDistancia = dist;
+      mejorMatch = ciudad;
+    }
+  }
+
+  // Si la distancia es muy grande (más de ~3 grados ≈ 300km), no hay match razonable
+  if (menorDistancia > 3) return null;
+
+  return mejorMatch;
+}
+
+/**
+ * Helper: envía respuesta de WhatsApp según su tipo
+ */
+async function enviarRespuesta(response, to, token, phoneNumberId) {
+  if (!response) return;
+  if (response.type === "text") {
+    await sendWhatsAppText({ to, token, phoneNumberId, text: response.text });
+  } else if (response.type === "list") {
+    await sendWhatsAppList({
+      to, token, phoneNumberId,
+      headerText: response.headerText,
+      bodyText: response.bodyText,
+      buttonText: response.buttonText,
+      sections: response.sections,
+    });
+  } else if (response.type === "button") {
+    await sendWhatsAppButtons({
+      to, token, phoneNumberId,
+      bodyText: response.bodyText,
+      buttons: response.buttons,
+    });
+  }
+}
+
+// =========================================================
+// �🚀 WEBHOOK PRINCIPAL - CHATBOT
 // =========================================================
 // Esta función maneja las peticiones de Meta (Webhook):
 // - Verifica el token (GET)
@@ -1859,6 +2258,39 @@ export const whatsappWebhookPadel = onRequest(
         } else {
           // No está en flujo de imagen, ignorar
           logger.info(`Usuario no está esperando imagen. Draft actual:`, draft);
+          return res.sendStatus(200);
+        }
+      } else if (msg.type === "location") {
+        // Mensaje de ubicación
+        const lat = msg.location?.latitude;
+        const lng = msg.location?.longitude;
+        logger.info(`📍 Ubicación recibida de ${from}: lat=${lat}, lng=${lng}`);
+
+        const draft = await getDraft(pool, from);
+
+        if (draft?.flow === "buscar_clubs" && draft?.step === "esperar_ubicacion") {
+          // Buscar el estado/ciudad más cercano usando coordenadas conocidas de ciudades
+          const resultado = encontrarCiudadCercana(lat, lng);
+
+          if (resultado) {
+            await saveDraftData(pool, from, "estado_ubicacion", resultado.estado);
+            await saveDraftData(pool, from, "ciudad_ubicacion", resultado.ciudad);
+            await setFlow(pool, from, "buscar_clubs", "resultado_ubicacion");
+
+            const response = await handleFlujoBuscarClubs(pool, from, "", "resultado_ubicacion", draft);
+            await enviarRespuesta(response, from, token, phoneNumberId);
+          } else {
+            await clearFlow(pool, from);
+            await sendWhatsAppText({
+              to: from,
+              token,
+              phoneNumberId,
+              text: `❌ No encontré clubs cerca de tu ubicación.\n\nIntenta buscar por nombre o navegar por estado.${textoVolverMenu()}`,
+            });
+          }
+          return res.sendStatus(200);
+        } else {
+          logger.info(`Usuario envió ubicación pero no está en flujo de búsqueda.`);
           return res.sendStatus(200);
         }
       } else {
