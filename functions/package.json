@@ -1,12 +1,15 @@
 {
   "type": "module",
-  "engines": { "node": "22" },
+  "engines": {
+    "node": "22"
+  },
   "dependencies": {
     "axios": "^1.7.0",
     "firebase-admin": "^12.5.0",
     "firebase-functions": "^5.0.0",
     "form-data": "^4.0.0",
-    "mysql2": "^3.9.0"
+    "mysql2": "^3.9.0",
+    "stripe": "^22.0.1"
   },
   "scripts": {
     "build": "echo \"No build step\"",

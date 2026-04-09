@@ -9,6 +9,7 @@ import * as logger from "firebase-functions/logger";      // Para registrar logs
 import { defineSecret } from "firebase-functions/params"; // Permite usar variables secretas seguras
 import axios from "axios";                                // Cliente HTTP (para enviar mensajes a WhatsApp)
 import mysql from "mysql2/promise";                       // Cliente MySQL para conexión a BD
+import Stripe from "stripe";                              // Stripe SDK para pagos
 
 // =========================================================
 // 🔐 SECRETS (valores sensibles, definidos en Firebase)
@@ -26,6 +27,10 @@ const DB_HOST = defineSecret("DB_HOST_PADEL");//           arosports.app
 const DB_USER = defineSecret("DB_USER_PADEL");//           arosport_arosports
 const DB_PASSWORD = defineSecret("DB_PASSWORD_PADEL");//   6F*HkXyk!udw
 const DB_NAME = defineSecret("DB_NAME_PADEL");//           arosport_arosports
+
+// Stripe
+const STRIPE_SECRET_KEY = defineSecret("STRIPE_SECRET_KEY_PADEL");
+const STRIPE_WEBHOOK_SECRET = defineSecret("STRIPE_WEBHOOK_SECRET_PADEL");
 
 // =========================================================
 // 🗄️ CONEXIÓN A MYSQL (Pool Lazy)
@@ -550,12 +555,118 @@ function textoVolverMenu() {
 }
 
 /**
- * Flujo 1: Reservar Cancha (Mejorado con listas interactivas)
+ * Genera los slots de horario disponibles para una cancha, fecha y día de la semana.
+ * Reutilizado por el paso de seleccionar club (para filtrar) y por seleccionar horario.
+ */
+async function generarSlotsDisponibles(pool, canchaId, fecha, diaSemana) {
+  // Obtener tarifas para esta cancha y día de la semana
+  const [tarifas] = await pool.query(
+    `SELECT id_tarifa, precio, intervalo, horario_inicio, horario_fin, dia, moneda
+     FROM tarifas
+     WHERE id_canchas = ? AND dia = ?
+     ORDER BY horario_inicio, intervalo`,
+    [canchaId, diaSemana]
+  );
+
+  if (tarifas.length === 0) return [];
+
+  // Obtener reservas existentes para esa cancha y fecha
+  const [reservasExistentes] = await pool.query(
+    `SELECT hora_inicio, hora_fin FROM reservas
+     WHERE id_cancha = ? AND fecha = ? AND id_status = 1`,
+    [canchaId, fecha]
+  );
+
+  // Generar slots desde las tarifas
+  const allSlots = [];
+  const ahoraMx = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Mexico_City" }));
+  const horaActual = ahoraMx.getHours();
+  const esHoy = fecha === `${ahoraMx.getFullYear()}-${String(ahoraMx.getMonth() + 1).padStart(2, "0")}-${String(ahoraMx.getDate()).padStart(2, "0")}`;
+
+  for (const tarifa of tarifas) {
+    const hiStr = String(tarifa.horario_inicio);
+    const hfStr = String(tarifa.horario_fin);
+    const intStr = String(tarifa.intervalo);
+    const hInicio = parseInt(hiStr.split(":")[0]) || 0;
+    const hFin = parseInt(hfStr.split(":")[0]) || 0;
+    const intervaloHoras = parseInt(intStr.split(":")[0]) || 1;
+
+    if (intervaloHoras <= 0 || hFin <= hInicio) continue;
+
+    for (let h = hInicio; h + intervaloHoras <= hFin; h += intervaloHoras) {
+      if (esHoy && h <= horaActual) continue;
+
+      const slotInicio = `${String(h).padStart(2, "0")}:00`;
+      const slotFin = `${String(h + intervaloHoras).padStart(2, "0")}:00`;
+
+      const estaReservado = reservasExistentes.some((r) => {
+        const rInicio = String(r.hora_inicio).substring(0, 5);
+        const rFin = String(r.hora_fin).substring(0, 5);
+        return slotInicio < rFin && slotFin > rInicio;
+      });
+
+      if (!estaReservado) {
+        allSlots.push({
+          inicio: slotInicio,
+          fin: slotFin,
+          duracion: intervaloHoras,
+          precio: parseFloat(tarifa.precio),
+          moneda: tarifa.moneda || "MXN",
+          id_tarifa: tarifa.id_tarifa,
+        });
+      }
+    }
+  }
+
+  // Eliminar duplicados (mismo inicio-fin)
+  const slotsUnicos = [];
+  const vistos = new Set();
+  for (const slot of allSlots) {
+    const key = `${slot.inicio}-${slot.fin}`;
+    if (!vistos.has(key)) {
+      vistos.add(key);
+      slotsUnicos.push(slot);
+    }
+  }
+
+  return slotsUnicos;
+}
+
+/**
+ * Limita un array de slots a máximo MAX filas para WhatsApp,
+ * distribuyendo equitativamente entre duraciones.
+ */
+function limitarSlotsParaWhatsApp(slotsUnicos, max = 10) {
+  if (slotsUnicos.length <= max) return slotsUnicos;
+
+  const porDur = {};
+  for (const s of slotsUnicos) {
+    if (!porDur[s.duracion]) porDur[s.duracion] = [];
+    porDur[s.duracion].push(s);
+  }
+  const durs = Object.keys(porDur).sort((a, b) => a - b);
+  const cuota = Math.floor(max / durs.length);
+  let extra = max - cuota * durs.length;
+  const resultado = [];
+  for (const dur of durs) {
+    const grupo = porDur[dur];
+    const n = Math.min(grupo.length, cuota + (extra > 0 ? 1 : 0));
+    if (extra > 0) extra--;
+    const step = grupo.length / n;
+    for (let i = 0; i < n; i++) {
+      resultado.push(grupo[Math.min(Math.floor(i * step), grupo.length - 1)]);
+    }
+  }
+  return resultado;
+}
+
+/**
+ * Flujo 1: Reservar Cancha
+ * Orden: Estado → Fecha → Clubs con disponibilidad → Cancha + Horarios → Confirmar
  */
 async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, draft, token, phoneNumberId) {
-  // PASO 1: Mostrar estados disponibles en lista interactiva
+  // ─── PASO 1: Mostrar estados disponibles ───
   if (currentStep === "inicio") {
-    // Obtener estados donde hay clubs afiliados activos que también existen en directorio_clubes
     const [estados] = await pool.query(
       `SELECT DISTINCT dc.estado
        FROM fraccionamiento_club fc
@@ -570,13 +681,12 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: " No hay estados disponibles en este momento." + textoVolverMenu(),
+        text: "No hay estados disponibles en este momento." + textoVolverMenu(),
       };
     }
 
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_estado");
 
-    // Crear secciones para la lista interactiva
     const rows = estados.map((e, idx) => ({
       id: `estado_${idx}`,
       title: e.estado || "Sin nombre",
@@ -588,18 +698,12 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
       headerText: "Estados Disponibles",
       bodyText: "Selecciona el estado donde quieres jugar:",
       buttonText: "Ver estados",
-      sections: [
-        {
-          title: "Selecciona tu estado",
-          rows: rows,
-        },
-      ],
+      sections: [{ title: "Selecciona tu estado", rows }],
     };
   }
 
-  // PASO 2: Capturar estado y mostrar clubs afiliados que existen en directorio
+  // ─── PASO 2: Capturar estado → mostrar fechas (próximos 7 días) ───
   if (currentStep === "seleccionar_estado") {
-    // Obtener estados para mapear la selección (misma query que PASO 1)
     const [estados] = await pool.query(
       `SELECT DISTINCT dc.estado
        FROM fraccionamiento_club fc
@@ -611,8 +715,6 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     );
 
     let estadoSeleccionado = null;
-
-    // Si viene de lista interactiva
     if (userInput.startsWith("estado_")) {
       const index = parseInt(userInput.split("_")[1]);
       if (index >= 0 && index < estados.length) {
@@ -621,162 +723,10 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     }
 
     if (!estadoSeleccionado) {
-      return {
-        type: "text",
-        text: " Selección inválida. Por favor selecciona un estado de la lista.",
-      };
+      return { type: "text", text: "Selección inválida. Por favor selecciona un estado de la lista." };
     }
 
-    // Guardar estado seleccionado
     await saveDraftData(pool, phoneNumber, "estado", estadoSeleccionado);
-
-    // Buscar clubs afiliados activos que existen en directorio_clubes en ese estado
-    const [clubs] = await pool.query(
-      `SELECT fc.id_fraccionamientoclub AS id_club, fc.fc_nombre AS nombre, dc.direccion AS colonia, dc.telefonos
-       FROM fraccionamiento_club fc
-       INNER JOIN directorio_clubes dc ON dc.nombre = fc.fc_nombre
-       WHERE dc.estado LIKE ? AND fc.id_status = 1
-       ORDER BY fc.fc_nombre
-       LIMIT 10`,
-      [`%${estadoSeleccionado}%`]
-    );
-
-    if (clubs.length === 0) {
-      await clearFlow(pool, phoneNumber);
-      return {
-        type: "text",
-        text: `No encontré clubs disponibles en *${estadoSeleccionado}*.` + textoVolverMenu(),
-      };
-    }
-
-    // Guardar clubs encontrados
-    await saveDraftData(pool, phoneNumber, "clubs_disponibles", clubs);
-    await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
-
-    // Crear lista interactiva de clubs
-    const rows = clubs.map((club, idx) => ({
-      id: `club_${idx}`,
-      title: club.nombre.substring(0, 24), // WhatsApp limita a 24 chars
-      description: club.colonia ? `${club.colonia.substring(0, 72)}` : "Club de pádel",
-    }));
-
-    return {
-      type: "list",
-      headerText: `Clubs en ${estadoSeleccionado}`,
-      bodyText: `Encontré ${clubs.length} club${clubs.length > 1 ? "s" : ""} disponible${clubs.length > 1 ? "s" : ""}. Selecciona uno:`,
-      buttonText: "Ver clubs",
-      sections: [
-        {
-          title: "Clubs disponibles",
-          rows: rows,
-        },
-      ],
-    };
-  }
-
-  // PASO 3: Capturar club y mostrar canchas disponibles
-  if (currentStep === "seleccionar_club") {
-    let clubSeleccionado = null;
-
-    // Verificar si viene con club preseleccionado desde info_club
-    if (userInput.startsWith("club_preseleccionado_")) {
-      const clubId = parseInt(userInput.split("_")[2]);
-      const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
-      clubSeleccionado = {
-        id_club: clubId,
-        nombre: clubNombre
-      };
-    } else {
-      // Flujo normal: selección desde lista
-      const clubs = await getDraftData(pool, phoneNumber, "clubs_disponibles");
-
-      // Si viene de lista interactiva
-      if (userInput.startsWith("club_")) {
-        const index = parseInt(userInput.split("_")[1]);
-        if (index >= 0 && index < clubs.length) {
-          clubSeleccionado = clubs[index];
-        }
-      }
-
-      if (!clubSeleccionado) {
-        return {
-          type: "text",
-          text: " Selección inválida. Por favor selecciona un club de la lista.",
-        };
-      }
-    }
-
-    // Guardar club seleccionado
-    await saveDraftData(pool, phoneNumber, "club_id", clubSeleccionado.id_club);
-    await saveDraftData(pool, phoneNumber, "club_nombre", clubSeleccionado.nombre);
-
-    // Obtener canchas activas del club
-    const [canchas] = await pool.query(
-      `SELECT id_canchas, can_nombre, can_deporte, can_tipo
-       FROM canchas
-       WHERE id_fraccionamientoclub = ? AND id_status = 1
-       ORDER BY can_nombre
-       LIMIT 10`,
-      [clubSeleccionado.id_club]
-    );
-
-    if (canchas.length === 0) {
-      await clearFlow(pool, phoneNumber);
-      return {
-        type: "text",
-        text: `No hay canchas disponibles en *${clubSeleccionado.nombre}*.` + textoVolverMenu(),
-      };
-    }
-
-    await saveDraftData(pool, phoneNumber, "canchas_disponibles", canchas);
-    await setFlow(pool, phoneNumber, "reservas", "seleccionar_cancha");
-
-    const rows = canchas.map((cancha, idx) => {
-      const deporte = cancha.can_deporte || "Padel";
-      const tipo = cancha.can_tipo || "";
-      const desc = tipo ? `${deporte} - ${tipo}` : deporte;
-      return {
-        id: `cancha_${idx}`,
-        title: (cancha.can_nombre || `Cancha ${idx + 1}`).substring(0, 24),
-        description: desc.substring(0, 72),
-      };
-    });
-
-    return {
-      type: "list",
-      headerText: "Canchas Disponibles",
-      bodyText: `Selecciona una cancha en *${clubSeleccionado.nombre}*:`,
-      buttonText: "Ver canchas",
-      sections: [
-        {
-          title: "Canchas",
-          rows: rows,
-        },
-      ],
-    };
-  }
-
-  // PASO 4: Capturar cancha y mostrar fechas disponibles
-  if (currentStep === "seleccionar_cancha") {
-    const canchas = await getDraftData(pool, phoneNumber, "canchas_disponibles");
-    let canchaSeleccionada = null;
-
-    if (userInput.startsWith("cancha_")) {
-      const index = parseInt(userInput.split("_")[1]);
-      if (index >= 0 && index < canchas.length) {
-        canchaSeleccionada = canchas[index];
-      }
-    }
-
-    if (!canchaSeleccionada) {
-      return {
-        type: "text",
-        text: " Selección inválida. Por favor selecciona una cancha de la lista.",
-      };
-    }
-
-    await saveDraftData(pool, phoneNumber, "cancha_id", canchaSeleccionada.id_canchas);
-    await saveDraftData(pool, phoneNumber, "cancha_nombre", canchaSeleccionada.can_nombre);
 
     // Generar próximos 7 días (hora de México)
     const diasSemana = ["Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"];
@@ -790,7 +740,7 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
       const fechaStr = `${año}-${mes}-${dia}`;
       const diaNombre = diasSemana[ahora.getDay()];
       const label = i === 0 ? `Hoy (${diaNombre} ${dia}/${mes})` : i === 1 ? `Mañana (${diaNombre} ${dia}/${mes})` : `${diaNombre} ${dia}/${mes}`;
-      fechas.push({ fecha: fechaStr, dia: diaNombre, label: label });
+      fechas.push({ fecha: fechaStr, dia: diaNombre, label });
     }
 
     await saveDraftData(pool, phoneNumber, "fechas_disponibles", fechas);
@@ -805,18 +755,13 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     return {
       type: "list",
       headerText: "Seleccionar Fecha",
-      bodyText: `Selecciona la fecha para tu reserva en *${canchaSeleccionada.can_nombre}*:`,
+      bodyText: `📍 *${estadoSeleccionado}*\n\nSelecciona la fecha para tu reserva:`,
       buttonText: "Ver fechas",
-      sections: [
-        {
-          title: "Próximos días",
-          rows: rows,
-        },
-      ],
+      sections: [{ title: "Próximos días", rows }],
     };
   }
 
-  // PASO 5: Capturar fecha y mostrar horarios disponibles con precios
+  // ─── PASO 3: Capturar fecha → buscar clubs con disponibilidad ese día ───
   if (currentStep === "seleccionar_fecha") {
     const fechas = await getDraftData(pool, phoneNumber, "fechas_disponibles");
     let fechaSeleccionada = null;
@@ -829,122 +774,209 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     }
 
     if (!fechaSeleccionada) {
-      return {
-        type: "text",
-        text: " Selección inválida. Por favor selecciona una fecha de la lista.",
-      };
+      return { type: "text", text: "Selección inválida. Por favor selecciona una fecha de la lista." };
     }
 
     await saveDraftData(pool, phoneNumber, "fecha", fechaSeleccionada.fecha);
     await saveDraftData(pool, phoneNumber, "fecha_label", fechaSeleccionada.label);
     await saveDraftData(pool, phoneNumber, "dia_semana", fechaSeleccionada.dia);
 
-    const canchaId = await getDraftData(pool, phoneNumber, "cancha_id");
-    const clubId = await getDraftData(pool, phoneNumber, "club_id");
+    const estadoSeleccionado = await getDraftData(pool, phoneNumber, "estado");
 
-    // Obtener tarifas para esta cancha y día de la semana
-    const [tarifas] = await pool.query(
-      `SELECT id_tarifa, precio, intervalo, horario_inicio, horario_fin, dia, moneda
-       FROM tarifas
-       WHERE id_canchas = ? AND dia = ?
-       ORDER BY horario_inicio, intervalo`,
-      [canchaId, fechaSeleccionada.dia]
+    // Buscar clubs del estado que tengan al menos una cancha con tarifas para ese día
+    const [clubs] = await pool.query(
+      `SELECT DISTINCT fc.id_fraccionamientoclub AS id_club, fc.fc_nombre AS nombre, dc.direccion AS colonia
+       FROM fraccionamiento_club fc
+       INNER JOIN directorio_clubes dc ON dc.nombre = fc.fc_nombre
+       INNER JOIN canchas c ON c.id_fraccionamientoclub = fc.id_fraccionamientoclub AND c.id_status = 1
+       INNER JOIN tarifas t ON t.id_canchas = c.id_canchas AND t.dia = ?
+       WHERE dc.estado LIKE ? AND fc.id_status = 1
+       ORDER BY fc.fc_nombre
+       LIMIT 10`,
+      [fechaSeleccionada.dia, `%${estadoSeleccionado}%`]
     );
 
-    if (tarifas.length === 0) {
+    if (clubs.length === 0) {
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: `No hay horarios disponibles para *${fechaSeleccionada.dia}* en esta cancha.` + textoVolverMenu(),
+        text: `No encontré clubs con disponibilidad para *${fechaSeleccionada.label}* en *${estadoSeleccionado}*.` + textoVolverMenu(),
       };
     }
 
-    // Obtener reservas existentes para esa cancha y fecha
-    const [reservasExistentes] = await pool.query(
-      `SELECT hora_inicio, hora_fin FROM reservas
-       WHERE id_cancha = ? AND fecha = ? AND id_status = 1`,
-      [canchaId, fechaSeleccionada.fecha]
-    );
+    await saveDraftData(pool, phoneNumber, "clubs_disponibles", clubs);
+    await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
 
-    // Generar slots desde las tarifas
-    const allSlots = [];
-    // Hora actual de México para filtrar slots pasados si es hoy
-    const ahoraMx = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Mexico_City" }));
-    const horaActual = ahoraMx.getHours();
-    const esHoy = fechaSeleccionada.fecha === `${ahoraMx.getFullYear()}-${String(ahoraMx.getMonth() + 1).padStart(2, "0")}-${String(ahoraMx.getDate()).padStart(2, "0")}`;
+    const rows = clubs.map((club, idx) => ({
+      id: `club_${idx}`,
+      title: club.nombre.substring(0, 24),
+      description: club.colonia ? club.colonia.substring(0, 72) : "Club de pádel",
+    }));
 
-    for (const tarifa of tarifas) {
-      // MySQL TIME puede venir como string "HH:MM:SS" o como número de milisegundos
-      const hiStr = String(tarifa.horario_inicio);
-      const hfStr = String(tarifa.horario_fin);
-      const intStr = String(tarifa.intervalo);
-      const hInicio = parseInt(hiStr.split(":")[0]) || 0;
-      const hFin = parseInt(hfStr.split(":")[0]) || 0;
-      const intervaloHoras = parseInt(intStr.split(":")[0]) || 1;
+    return {
+      type: "list",
+      headerText: `Clubs disponibles`,
+      bodyText: `📍 *${estadoSeleccionado}* - 📅 *${fechaSeleccionada.label}*\n\nEstos clubs tienen canchas disponibles:`,
+      buttonText: "Ver clubs",
+      sections: [{ title: "Clubs disponibles", rows }],
+    };
+  }
 
-      logger.info(`Tarifa ${tarifa.id_tarifa}: inicio=${hiStr}, fin=${hfStr}, intervalo=${intStr}, parsed: h${hInicio}-${hFin} cada ${intervaloHoras}hr`);
+  // ─── PASO 3b: Fecha con club preseleccionado (viene desde info_club) ───
+  if (currentStep === "seleccionar_fecha_preclub") {
+    const fechas = await getDraftData(pool, phoneNumber, "fechas_disponibles");
+    let fechaSeleccionada = null;
 
-      if (intervaloHoras <= 0 || hFin <= hInicio) continue;
+    if (userInput.startsWith("fecha_")) {
+      const index = parseInt(userInput.split("_")[1]);
+      if (index >= 0 && index < fechas.length) {
+        fechaSeleccionada = fechas[index];
+      }
+    }
 
-      for (let h = hInicio; h + intervaloHoras <= hFin; h++) {
-        // Si es hoy, filtrar horarios que ya pasaron
-        if (esHoy && h <= horaActual) continue;
+    if (!fechaSeleccionada) {
+      return { type: "text", text: "Selección inválida. Por favor selecciona una fecha de la lista." };
+    }
 
-        const slotInicio = `${String(h).padStart(2, "0")}:00`;
-        const slotFin = `${String(h + intervaloHoras).padStart(2, "0")}:00`;
+    await saveDraftData(pool, phoneNumber, "fecha", fechaSeleccionada.fecha);
+    await saveDraftData(pool, phoneNumber, "fecha_label", fechaSeleccionada.label);
+    await saveDraftData(pool, phoneNumber, "dia_semana", fechaSeleccionada.dia);
 
-        // Verificar si no está reservado (que no se solape)
-        const estaReservado = reservasExistentes.some((r) => {
-          const rInicio = String(r.hora_inicio).substring(0, 5);
-          const rFin = String(r.hora_fin).substring(0, 5);
-          return slotInicio < rFin && slotFin > rInicio;
-        });
+    // Club ya está guardado, ir directo a mostrar canchas
+    const clubId = await getDraftData(pool, phoneNumber, "club_id");
+    const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
 
-        if (!estaReservado) {
-          allSlots.push({
-            inicio: slotInicio,
-            fin: slotFin,
-            duracion: intervaloHoras,
-            precio: parseFloat(tarifa.precio),
-            moneda: tarifa.moneda || "MXN",
-            id_tarifa: tarifa.id_tarifa,
-          });
+    return await handleFlujoReservas(pool, phoneNumber, `club_preseleccionado_${clubId}`, "seleccionar_club", draft, token, phoneNumberId);
+  }
+
+  // ─── PASO 4: Capturar club → mostrar canchas con horarios disponibles ───
+  if (currentStep === "seleccionar_club") {
+    let clubSeleccionado = null;
+
+    // Verificar si viene con club preseleccionado desde info_club
+    if (userInput.startsWith("club_preseleccionado_")) {
+      const clubId = parseInt(userInput.split("_")[2]);
+      const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
+      clubSeleccionado = { id_club: clubId, nombre: clubNombre };
+    } else {
+      const clubs = await getDraftData(pool, phoneNumber, "clubs_disponibles");
+      if (userInput.startsWith("club_")) {
+        const index = parseInt(userInput.split("_")[1]);
+        if (index >= 0 && index < clubs.length) {
+          clubSeleccionado = clubs[index];
         }
       }
-    }
 
-    // Eliminar duplicados (mismo inicio-fin)
-    const slotsUnicos = [];
-    const vistos = new Set();
-    for (const slot of allSlots) {
-      const key = `${slot.inicio}-${slot.fin}`;
-      if (!vistos.has(key)) {
-        vistos.add(key);
-        slotsUnicos.push(slot);
+      if (!clubSeleccionado) {
+        return { type: "text", text: "Selección inválida. Por favor selecciona un club de la lista." };
       }
     }
 
-    if (slotsUnicos.length === 0) {
+    await saveDraftData(pool, phoneNumber, "club_id", clubSeleccionado.id_club);
+    await saveDraftData(pool, phoneNumber, "club_nombre", clubSeleccionado.nombre);
+
+    const fecha = await getDraftData(pool, phoneNumber, "fecha");
+    const diaSemana = await getDraftData(pool, phoneNumber, "dia_semana");
+
+    // Obtener canchas activas del club
+    const [canchasRaw] = await pool.query(
+      `SELECT id_canchas, can_nombre, can_deporte, can_tipo
+       FROM canchas
+       WHERE id_fraccionamientoclub = ? AND id_status = 1
+       ORDER BY can_nombre
+       LIMIT 10`,
+      [clubSeleccionado.id_club]
+    );
+
+    // Filtrar solo canchas que tienen slots disponibles para esa fecha
+    const canchasConDisponibilidad = [];
+    for (const cancha of canchasRaw) {
+      const slots = await generarSlotsDisponibles(pool, cancha.id_canchas, fecha, diaSemana);
+      if (slots.length > 0) {
+        canchasConDisponibilidad.push({ ...cancha, totalSlots: slots.length });
+      }
+    }
+
+    if (canchasConDisponibilidad.length === 0) {
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: `No hay horarios disponibles para *${fechaSeleccionada.label}* en esta cancha. Todos los horarios están ocupados.` + textoVolverMenu(),
+        text: `No hay canchas con horarios disponibles en *${clubSeleccionado.nombre}* para esa fecha.` + textoVolverMenu(),
+      };
+    }
+
+    await saveDraftData(pool, phoneNumber, "canchas_disponibles", canchasConDisponibilidad);
+    await setFlow(pool, phoneNumber, "reservas", "seleccionar_cancha");
+
+    const fechaLabel = await getDraftData(pool, phoneNumber, "fecha_label");
+    const rows = canchasConDisponibilidad.map((cancha, idx) => {
+      const deporte = cancha.can_deporte || "Padel";
+      const tipo = cancha.can_tipo || "";
+      const desc = tipo ? `${deporte} - ${tipo} (${cancha.totalSlots} horarios)` : `${deporte} (${cancha.totalSlots} horarios)`;
+      return {
+        id: `cancha_${idx}`,
+        title: (cancha.can_nombre || `Cancha ${idx + 1}`).substring(0, 24),
+        description: desc.substring(0, 72),
+      };
+    });
+
+    return {
+      type: "list",
+      headerText: "Canchas Disponibles",
+      bodyText: `🏟️ *${clubSeleccionado.nombre}*\n📅 *${fechaLabel}*\n\nSelecciona una cancha:`,
+      buttonText: "Ver canchas",
+      sections: [{ title: "Canchas", rows }],
+    };
+  }
+
+  // ─── PASO 5: Capturar cancha → mostrar horarios disponibles con precios ───
+  if (currentStep === "seleccionar_cancha") {
+    const canchas = await getDraftData(pool, phoneNumber, "canchas_disponibles");
+    let canchaSeleccionada = null;
+
+    if (userInput.startsWith("cancha_")) {
+      const index = parseInt(userInput.split("_")[1]);
+      if (index >= 0 && index < canchas.length) {
+        canchaSeleccionada = canchas[index];
+      }
+    }
+
+    if (!canchaSeleccionada) {
+      return { type: "text", text: "Selección inválida. Por favor selecciona una cancha de la lista." };
+    }
+
+    await saveDraftData(pool, phoneNumber, "cancha_id", canchaSeleccionada.id_canchas);
+    await saveDraftData(pool, phoneNumber, "cancha_nombre", canchaSeleccionada.can_nombre);
+
+    const fecha = await getDraftData(pool, phoneNumber, "fecha");
+    const diaSemana = await getDraftData(pool, phoneNumber, "dia_semana");
+
+    // Generar slots disponibles (re-calcula en tiempo real)
+    const slotsUnicos = await generarSlotsDisponibles(pool, canchaSeleccionada.id_canchas, fecha, diaSemana);
+
+    if (slotsUnicos.length === 0) {
+      await clearFlow(pool, phoneNumber);
+      const fechaLabel = await getDraftData(pool, phoneNumber, "fecha_label");
+      return {
+        type: "text",
+        text: `No hay horarios disponibles para *${fechaLabel}* en esta cancha. Todos los horarios están ocupados.` + textoVolverMenu(),
       };
     }
 
     await saveDraftData(pool, phoneNumber, "slots_disponibles", slotsUnicos);
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_horario");
 
-    // Agrupar slots por duración dinámicamente (máx 10 por sección)
+    // Limitar a 10 filas para WhatsApp
+    const slotsParaMostrar = limitarSlotsParaWhatsApp(slotsUnicos);
+
+    // Agrupar por duración
     const porDuracion = {};
-    for (const slot of slotsUnicos) {
+    for (const slot of slotsParaMostrar) {
       if (!porDuracion[slot.duracion]) porDuracion[slot.duracion] = [];
       porDuracion[slot.duracion].push(slot);
     }
 
     const sections = [];
-
-    // Función para crear filas de slots
     const crearFilas = (slots) =>
       slots.map((slot) => ({
         id: `slot_${slotsUnicos.indexOf(slot)}`,
@@ -955,36 +987,29 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     for (const dur of Object.keys(porDuracion).sort((a, b) => a - b)) {
       const grupo = porDuracion[dur];
       const titulo = `${dur} Hora${dur > 1 ? "s" : ""}`;
-      if (grupo.length <= 10) {
-        sections.push({ title: titulo, rows: crearFilas(grupo) });
-      } else {
-        const primera = grupo.slice(0, 10);
-        const segunda = grupo.slice(10, 20);
-        sections.push({ title: `${titulo} - Mañana`, rows: crearFilas(primera) });
-        if (segunda.length > 0) sections.push({ title: `${titulo} - Tarde`, rows: crearFilas(segunda) });
-      }
+      sections.push({ title: titulo, rows: crearFilas(grupo) });
     }
 
-    // Fallback: si por alguna razón no se generaron secciones, agrupar todos
     if (sections.length === 0) {
-      const todas = slotsUnicos.slice(0, 10);
-      sections.push({ title: "Horarios", rows: crearFilas(todas) });
+      sections.push({ title: "Horarios", rows: crearFilas(slotsParaMostrar) });
     }
 
-    const canchaNombre = await getDraftData(pool, phoneNumber, "cancha_nombre");
+    const canchaNombre = canchaSeleccionada.can_nombre;
+    const fechaLabel = await getDraftData(pool, phoneNumber, "fecha_label");
 
-    logger.info(`Horarios list: ${slotsUnicos.length} slots, ${sections.length} secciones, rows por sección: ${sections.map(s => s.rows.length).join(",")}`);
-    
+    const totalRows = sections.reduce((sum, s) => sum + s.rows.length, 0);
+    logger.info(`Horarios list: ${slotsUnicos.length} slots totales, mostrando ${totalRows} en ${sections.length} secciones`);
+
     return {
       type: "list",
       headerText: "Horarios Disponibles",
-      bodyText: `*${canchaNombre}* - *${fechaSeleccionada.label}*\n\nSelecciona un horario:`,
+      bodyText: `*${canchaNombre}* - *${fechaLabel}*\n\nSelecciona un horario:`,
       buttonText: "Ver horarios",
-      sections: sections,
+      sections,
     };
   }
 
-  // PASO 6: Capturar horario y mostrar confirmación
+  // ─── PASO 6: Capturar horario → mostrar confirmación ───
   if (currentStep === "seleccionar_horario") {
     const slots = await getDraftData(pool, phoneNumber, "slots_disponibles");
     let slotSeleccionado = null;
@@ -997,16 +1022,12 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     }
 
     if (!slotSeleccionado) {
-      return {
-        type: "text",
-        text: " Selección inválida. Por favor selecciona un horario de la lista.",
-      };
+      return { type: "text", text: "Selección inválida. Por favor selecciona un horario de la lista." };
     }
 
     await saveDraftData(pool, phoneNumber, "slot_seleccionado", slotSeleccionado);
     await setFlow(pool, phoneNumber, "reservas", "confirmar_reserva");
 
-    // Recuperar datos para resumen
     const estado = await getDraftData(pool, phoneNumber, "estado");
     const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
     const canchaNombre = await getDraftData(pool, phoneNumber, "cancha_nombre");
@@ -1014,7 +1035,7 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
 
     return {
       type: "button",
-      bodyText: `🎾 *Resumen de tu reserva*\n\n📍 *Estado:* ${estado}\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slotSeleccionado.inicio} - ${slotSeleccionado.fin}\n⌛ *Duración:* ${slotSeleccionado.duracion} hora${slotSeleccionado.duracion > 1 ? "s" : ""}\n💰 *Precio:* $${slotSeleccionado.precio} ${slotSeleccionado.moneda}\n\n¿Confirmas tu reserva?`,
+      bodyText: `🎾 *Resumen de tu reserva*\n\n📍 *Estado:* ${estado}\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slotSeleccionado.inicio} - ${slotSeleccionado.fin}\n⌛ *Duración:* ${slotSeleccionado.duracion} hora${slotSeleccionado.duracion > 1 ? "s" : ""}\n💰 *Precio total:* $${slotSeleccionado.precio} ${slotSeleccionado.moneda}\n\n¿Confirmas tu reserva?`,
       buttons: [
         { type: "reply", reply: { id: "confirmar_si", title: "✅ Confirmar" } },
         { type: "reply", reply: { id: "confirmar_no", title: "❌ Cancelar" } },
@@ -1022,23 +1043,50 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     };
   }
 
-  // PASO 7: Confirmar o cancelar reserva
+  // ─── PASO 7: Confirmar → elegir tipo de pago ───
   if (currentStep === "confirmar_reserva") {
     if (userInput === "confirmar_no") {
       await clearFlow(pool, phoneNumber);
-      return {
-        type: "text",
-        text: "❌ Reserva cancelada." + textoVolverMenu(),
-      };
+      return { type: "text", text: "❌ Reserva cancelada." + textoVolverMenu() };
     }
 
     if (userInput === "confirmar_si") {
-      // Recuperar TODOS los datos antes de limpiar
+      const slot = await getDraftData(pool, phoneNumber, "slot_seleccionado");
+      const precioParcial = Math.ceil(slot.precio / 4);
+
+      await setFlow(pool, phoneNumber, "reservas", "seleccionar_tipo_pago");
+
+      return {
+        type: "button",
+        bodyText: `💳 *¿Cómo deseas pagar?*\n\n💰 *Pago completo:* $${slot.precio} ${slot.moneda}\n_Paga el total ahora._\n\n💵 *Pago parcial:* $${precioParcial} ${slot.moneda}\n_Paga el 25% ahora y el resto en el club._`,
+        buttons: [
+          { type: "reply", reply: { id: "pago_completo", title: "💰 Pago completo" } },
+          { type: "reply", reply: { id: "pago_parcial", title: "💵 Pago parcial (25%)" } },
+        ],
+      };
+    }
+
+    return { type: "text", text: "Por favor selecciona *Confirmar* o *Cancelar*." };
+  }
+
+  // ─── PASO 8: Tipo de pago → crear Stripe Checkout ───
+  if (currentStep === "seleccionar_tipo_pago") {
+    if (userInput !== "pago_completo" && userInput !== "pago_parcial") {
+      return { type: "text", text: "Por favor selecciona *Pago completo* o *Pago parcial*." };
+    }
+
+    const esParcial = userInput === "pago_parcial";
+    await saveDraftData(pool, phoneNumber, "tipo_pago", esParcial ? "parcial" : "completo");
+
+    if (userInput === "confirmar_si") {
+      // This branch shouldn't be reached, but kept for safety
+    }
+
+    {
       const clubId = await getDraftData(pool, phoneNumber, "club_id");
       const canchaId = await getDraftData(pool, phoneNumber, "cancha_id");
       const fecha = await getDraftData(pool, phoneNumber, "fecha");
       const slot = await getDraftData(pool, phoneNumber, "slot_seleccionado");
-      const estado = await getDraftData(pool, phoneNumber, "estado");
       const clubNombre = await getDraftData(pool, phoneNumber, "club_nombre");
       const canchaNombre = await getDraftData(pool, phoneNumber, "cancha_nombre");
       const fechaLabel = await getDraftData(pool, phoneNumber, "fecha_label");
@@ -1060,39 +1108,84 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
         };
       }
 
-      // Guardar la reserva
-      const duracionTime = `${String(slot.duracion).padStart(2, "0")}:00:00`;
-      const [resultado] = await pool.query(
-        `INSERT INTO reservas (id_fraccionamientoclub, fecha, hora_inicio, hora_fin, id_cancha, id_status, precio, duracion, moneda, tipo_evento)
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 'reserva')`,
-        [clubId, fecha, slot.inicio + ":00", slot.fin + ":00", canchaId, slot.precio, duracionTime, slot.moneda]
+      // Obtener la cuenta conectada de Stripe del club
+      const [clubRows] = await pool.query(
+        `SELECT stripe_account_id FROM fraccionamiento_club WHERE id_fraccionamientoclub = ?`,
+        [clubId]
       );
+      const stripeAccountId = clubRows[0]?.stripe_account_id;
 
-      const idReserva = resultado.insertId;
-
-      // Obtener id_usuario del que reserva
-      const usuario = await getFullUserByPhone(pool, phoneNumber);
-      if (usuario) {
-        await pool.query(
-          `INSERT INTO reservas_participantes (id_reserva, id_usuario, costo_individual)
-           VALUES (?, ?, ?)`,
-          [idReserva, usuario.id_usuario, slot.precio]
-        );
+      if (!stripeAccountId) {
+        await clearFlow(pool, phoneNumber);
+        return {
+          type: "text",
+          text: "⚠️ Este club aún no tiene pagos en línea habilitados. Por favor contacta al club directamente para reservar." + textoVolverMenu(),
+        };
       }
 
-      // Limpiar draft DESPUÉS de recuperar datos y guardar
+      // Crear Stripe Checkout Session
+      const stripe = new Stripe(STRIPE_SECRET_KEY.value().trim());
+      const moneda = (slot.moneda || "MXN").toLowerCase();
+      const precioTotal = slot.precio;
+      const precioParcial = Math.ceil(precioTotal / 4);
+      const montoCobrar = esParcial ? precioParcial : precioTotal;
+      const precioEnCentavos = Math.round(montoCobrar * 100);
+      const restanteEnClub = esParcial ? precioTotal - precioParcial : 0;
+
+      const descripcionProducto = esParcial
+        ? `${fechaLabel} | ${slot.inicio} - ${slot.fin} (${slot.duracion}hr) — Pago parcial 25%`
+        : `${fechaLabel} | ${slot.inicio} - ${slot.fin} (${slot.duracion}hr)`;
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        line_items: [
+          {
+            price_data: {
+              currency: moneda,
+              product_data: {
+                name: `Reserva: ${canchaNombre}`,
+                description: descripcionProducto,
+              },
+              unit_amount: precioEnCentavos,
+            },
+            quantity: 1,
+          },
+        ],
+        payment_intent_data: {
+          application_fee_amount: 2000, // $20 MXN comisión plataforma
+          transfer_data: {
+            destination: stripeAccountId,
+          },
+        },
+        metadata: {
+          phoneNumber,
+          clubId: String(clubId),
+          canchaId: String(canchaId),
+          fecha,
+          slotInicio: slot.inicio,
+          slotFin: slot.fin,
+          slotDuracion: String(slot.duracion),
+          slotPrecio: String(precioTotal),
+          slotMoneda: slot.moneda,
+          clubNombre,
+          canchaNombre,
+          fechaLabel,
+          tipoPago: esParcial ? "parcial" : "completo",
+          montoPagado: String(montoCobrar),
+          montoRestante: String(restanteEnClub),
+        },
+        success_url: "https://soportetecnico-8f595.web.app/pago-exitoso",
+        cancel_url: "https://soportetecnico-8f595.web.app/pago-cancelado",
+      });
+
       await clearFlow(pool, phoneNumber);
 
-      return {
-        type: "text",
-        text: `✅ *¡Reserva Confirmada!*\n\n🆔 *Folio:* #${idReserva}\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n⌛ *Duración:* ${slot.duracion} hora${slot.duracion > 1 ? "s" : ""}\n💰 *Precio:* $${slot.precio} ${slot.moneda}\n\n¡Te esperamos! 🎾` + textoVolverMenu(),
-      };
-    }
+      const textoPago = esParcial
+        ? `💳 *Pago Parcial de Reserva (25%)*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Precio total:* $${precioTotal} ${slot.moneda}\n💵 *Pagas ahora:* $${montoCobrar} ${slot.moneda}\n🏦 *Pagas en el club:* $${restanteEnClub} ${slot.moneda}\n\n👉 Haz clic en el siguiente enlace para pagar:\n${session.url}\n\n⏱️ El enlace expira en 30 minutos.\n_Tu reserva se confirmará automáticamente al completar el pago._`
+        : `💳 *Pago Completo de Reserva*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Total:* $${precioTotal} ${slot.moneda}\n\n👉 Haz clic en el siguiente enlace para pagar:\n${session.url}\n\n⏱️ El enlace expira en 30 minutos.\n_Tu reserva se confirmará automáticamente al completar el pago._`;
 
-    return {
-      type: "text",
-      text: "Por favor selecciona *Confirmar* o *Cancelar*.",
-    };
+      return { type: "text", text: textoPago };
+    }
   }
 }
 
@@ -1710,21 +1803,44 @@ async function handleFlujoInfoClub(pool, phoneNumber, userInput, currentStep, dr
         };
       }
       
+      // Guardar club y pasar al flujo de reservas en paso de seleccionar fecha
+      // (el club ya está preseleccionado, solo falta que elija fecha)
       await saveDraftData(pool, phoneNumber, "club_id", clubFC[0].id_fraccionamientoclub);
       await saveDraftData(pool, phoneNumber, "club_nombre", clubFC[0].fc_nombre);
-      
-      // Cambiar a flujo de reservas y mostrar horarios directamente
-      await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
-      
-      // Simular que viene desde seleccionar_club con el club ya elegido
-      return await handleFlujoReservas(pool, phoneNumber, `club_preseleccionado_${clubFC[0].id_fraccionamientoclub}`, "seleccionar_club", {
-        ...draft,
-        data: {
-          ...draft.data,
-          club_id: clubFC[0].id_fraccionamientoclub,
-          club_nombre: clubFC[0].fc_nombre
-        }
-      }, token, phoneNumberId);
+
+      // Generar próximos 7 días
+      const diasSemana = ["Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"];
+      const fechas = [];
+      for (let i = 0; i < 7; i++) {
+        const ahora = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Mexico_City" }));
+        ahora.setDate(ahora.getDate() + i);
+        const año = ahora.getFullYear();
+        const mes = String(ahora.getMonth() + 1).padStart(2, "0");
+        const dia = String(ahora.getDate()).padStart(2, "0");
+        const fechaStr = `${año}-${mes}-${dia}`;
+        const diaNombre = diasSemana[ahora.getDay()];
+        const label = i === 0 ? `Hoy (${diaNombre} ${dia}/${mes})` : i === 1 ? `Mañana (${diaNombre} ${dia}/${mes})` : `${diaNombre} ${dia}/${mes}`;
+        fechas.push({ fecha: fechaStr, dia: diaNombre, label });
+      }
+
+      await saveDraftData(pool, phoneNumber, "fechas_disponibles", fechas);
+      // Marcar que viene preseleccionado para que al elegir fecha salte directo a canchas
+      await saveDraftData(pool, phoneNumber, "club_preseleccionado", true);
+      await setFlow(pool, phoneNumber, "reservas", "seleccionar_fecha_preclub");
+
+      const rows = fechas.map((f, idx) => ({
+        id: `fecha_${idx}`,
+        title: f.label.substring(0, 24),
+        description: f.fecha,
+      }));
+
+      return {
+        type: "list",
+        headerText: "Seleccionar Fecha",
+        bodyText: `🏟️ *${clubFC[0].fc_nombre}*\n\nSelecciona la fecha para tu reserva:`,
+        buttonText: "Ver fechas",
+        sections: [{ title: "Próximos días", rows }],
+      };
     } else if (userInput === "2") {
       await clearFlow(pool, phoneNumber);
       const tieneSuscripcion = draft?.tieneSuscripcionActiva || false;
@@ -2432,7 +2548,7 @@ export const whatsappWebhookPadel = onRequest(
   {
     cors: true,
     region: "us-central1",
-    secrets: [VERIFY_TOKEN, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME],
+    secrets: [VERIFY_TOKEN, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, STRIPE_SECRET_KEY],
   },
   async (req, res) => {
     // Carga las variables desde los secrets
@@ -2459,8 +2575,13 @@ export const whatsappWebhookPadel = onRequest(
     }
 
     // === Fase 2: Procesamiento de mensajes entrantes (POST)
+    const body = req.body;
+    const messages = body?.entry?.[0]?.changes?.[0]?.value?.messages;
+    const from = messages?.[0]?.from;
+    const token = cfg.WHATSAPP_TOKEN;
+    const phoneNumberId = cfg.WHATSAPP_PHONE_NUMBER_ID;
+
     try {
-      const body = req.body;
       logger.info("Webhook body", body);
 
       // Ignora notificaciones de "status" (mensajes entregados, leídos, etc.)
@@ -2468,12 +2589,8 @@ export const whatsappWebhookPadel = onRequest(
       if (Array.isArray(statuses) && statuses.length) return res.sendStatus(200);
 
       // Extrae mensaje y número del remitente
-      const messages = body?.entry?.[0]?.changes?.[0]?.value?.messages;
-      const from = messages?.[0]?.from;
       if (!messages || !from) return res.sendStatus(200);
 
-      const token = cfg.WHATSAPP_TOKEN;
-      const phoneNumberId = cfg.WHATSAPP_PHONE_NUMBER_ID;
       const msg = messages[0];
 
       const pool = getPool(cfg);
@@ -2707,7 +2824,148 @@ export const whatsappWebhookPadel = onRequest(
       if (err?.response?.status === 400) {
         logger.error("Request que falló (payload):", JSON.stringify(err?.config?.data || "N/A").substring(0, 2000));
       }
+
+      // Intentar enviar mensaje de error al usuario para que no se quede sin respuesta
+      try {
+        if (from && token && phoneNumberId) {
+          await sendWhatsAppText({
+            to: from,
+            token,
+            phoneNumberId,
+            text: "⚠️ Ocurrió un error al procesar tu solicitud. Por favor intenta de nuevo.\n\n_Escribe 'Hola' para volver al menú principal._",
+          });
+        }
+      } catch (sendErr) {
+        logger.error("Error al enviar mensaje de error al usuario:", sendErr.message);
+      }
+
       return res.sendStatus(200);
+    }
+  }
+);
+
+// =========================================================
+// 💳 STRIPE WEBHOOK – Recibe eventos de pago completado
+// =========================================================
+export const stripeWebhookPadel = onRequest(
+  {
+    cors: false,
+    region: "us-central1",
+    invoker: "public",
+    secrets: [STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME],
+  },
+  async (req, res) => {
+    if (req.method !== "POST") return res.sendStatus(405);
+
+    const stripe = new Stripe(STRIPE_SECRET_KEY.value().trim());
+
+    // Verificar la firma del webhook de Stripe
+    const sig = req.headers["stripe-signature"];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.rawBody,
+        sig,
+        STRIPE_WEBHOOK_SECRET.value().trim()
+      );
+    } catch (err) {
+      logger.error("⚠️ Stripe webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Solo procesar checkout.session.completed
+    if (event.type !== "checkout.session.completed") {
+      logger.info(`Stripe event ignorado: ${event.type}`);
+      return res.sendStatus(200);
+    }
+
+    const session = event.data.object;
+    const meta = session.metadata;
+
+    if (!meta?.phoneNumber || !meta?.clubId || !meta?.canchaId) {
+      logger.error("Stripe webhook: metadata incompleta", meta);
+      return res.sendStatus(200);
+    }
+
+    const cfg = {
+      DB_HOST: DB_HOST.value(),
+      DB_USER: DB_USER.value(),
+      DB_PASSWORD: DB_PASSWORD.value(),
+      DB_NAME: DB_NAME.value(),
+    };
+    const pool = getPool(cfg);
+
+    try {
+      // Verificar que el horario sigue disponible
+      const [conflicto] = await pool.query(
+        `SELECT id_reserva FROM reservas
+         WHERE id_cancha = ? AND fecha = ? AND id_status = 1
+         AND hora_inicio < ? AND hora_fin > ?
+         LIMIT 1`,
+        [meta.canchaId, meta.fecha, meta.slotFin + ":00", meta.slotInicio + ":00"]
+      );
+
+      if (conflicto.length > 0) {
+        logger.warn("Stripe webhook: horario ya fue ocupado después del pago", meta);
+        // Aun así guardar con status especial o notificar
+        const token = WHATSAPP_TOKEN.value();
+        const phoneNumberId = WHATSAPP_PHONE_NUMBER_ID.value();
+        await sendWhatsAppText({
+          to: meta.phoneNumber,
+          token,
+          phoneNumberId,
+          text: `⚠️ *Pago recibido pero horario ocupado*\n\nTu pago fue procesado, pero el horario ${meta.slotInicio} - ${meta.slotFin} en ${meta.canchaNombre} el ${meta.fechaLabel} fue reservado por alguien más mientras pagabas.\n\nNos pondremos en contacto para ofrecerte otro horario o un reembolso.\n\n_Escribe 'Hola' para volver al menú._`,
+        });
+        return res.sendStatus(200);
+      }
+
+      // Guardar la reserva
+      const duracion = parseInt(meta.slotDuracion);
+      const duracionTime = `${String(duracion).padStart(2, "0")}:00:00`;
+      const precio = parseFloat(meta.slotPrecio);
+
+      const [resultado] = await pool.query(
+        `INSERT INTO reservas (id_fraccionamientoclub, fecha, hora_inicio, hora_fin, id_cancha, id_status, precio, duracion, moneda, tipo_evento)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 'reserva')`,
+        [meta.clubId, meta.fecha, meta.slotInicio + ":00", meta.slotFin + ":00", meta.canchaId, precio, duracionTime, meta.slotMoneda]
+      );
+
+      const idReserva = resultado.insertId;
+
+      // Obtener id_usuario del que reserva y vincularlo
+      const usuario = await getFullUserByPhone(pool, meta.phoneNumber);
+      if (usuario) {
+        await pool.query(
+          `INSERT INTO reservas_participantes (id_reserva, id_usuario, costo_individual)
+           VALUES (?, ?, ?)`,
+          [idReserva, usuario.id_usuario, precio]
+        );
+      }
+
+      // Enviar confirmación por WhatsApp
+      const token = WHATSAPP_TOKEN.value();
+      const phoneNumberId = WHATSAPP_PHONE_NUMBER_ID.value();
+
+      const esParcial = meta.tipoPago === "parcial";
+      const montoPagado = meta.montoPagado || meta.slotPrecio;
+      const montoRestante = meta.montoRestante || "0";
+
+      const textoConfirmacion = esParcial
+        ? `✅ *¡Pago parcial recibido y reserva confirmada!*\n\n🆔 *Folio:* #${idReserva}\n🏟️ *Club:* ${meta.clubNombre}\n🎾 *Cancha:* ${meta.canchaNombre}\n📅 *Fecha:* ${meta.fechaLabel}\n⏰ *Horario:* ${meta.slotInicio} - ${meta.slotFin}\n⌛ *Duración:* ${duracion} hora${duracion > 1 ? "s" : ""}\n💰 *Precio total:* $${meta.slotPrecio} ${meta.slotMoneda}\n💵 *Pagado en línea:* $${montoPagado} ${meta.slotMoneda}\n🏦 *Restante a pagar en club:* $${montoRestante} ${meta.slotMoneda}\n\n¡Te esperamos! 🎾\n\n_Escribe 'Hola' para volver al menú._`
+        : `✅ *¡Pago recibido y reserva confirmada!*\n\n🆔 *Folio:* #${idReserva}\n🏟️ *Club:* ${meta.clubNombre}\n🎾 *Cancha:* ${meta.canchaNombre}\n📅 *Fecha:* ${meta.fechaLabel}\n⏰ *Horario:* ${meta.slotInicio} - ${meta.slotFin}\n⌛ *Duración:* ${duracion} hora${duracion > 1 ? "s" : ""}\n💰 *Pagado:* $${meta.slotPrecio} ${meta.slotMoneda}\n\n¡Te esperamos! 🎾\n\n_Escribe 'Hola' para volver al menú._`;
+
+      await sendWhatsAppText({
+        to: meta.phoneNumber,
+        token,
+        phoneNumberId,
+        text: textoConfirmacion,
+      });
+
+      logger.info(`✅ Reserva #${idReserva} creada tras pago Stripe session ${session.id}`);
+      return res.sendStatus(200);
+    } catch (err) {
+      logger.error("Error en stripeWebhookPadel:", err);
+      return res.status(500).send("Error procesando webhook");
     }
   }
 );
