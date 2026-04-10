@@ -385,7 +385,7 @@ async function getUserByPhone(pool, phoneNumber) {
     // 3. Si no encuentra, busca por coincidencia parcial del número completo
     if (rows.length === 0) {
       [rows] = await pool.query(
-        "SELECT us_nombre, us_apellidop FROM usuarios WHERE ? LIKE CONCAT('%', us_telefono, '%') AND us_telefono != '0' AND us_telefono != '2147483647' LIMIT 1",
+        "SELECT us_nombre, us_apellidop FROM usuarios WHERE ? LIKE CONCAT('%', us_telefono, '%') AND us_telefono != '0' AND us_telefono != '2147483647' AND LENGTH(us_telefono) >= 10 LIMIT 1",
         [phoneNumber]
       );
     }
@@ -460,7 +460,7 @@ async function getFullUserByPhone(pool, phoneNumber) {
     if (rows.length === 0) {
       logger.info(`Intentando búsqueda por coincidencia parcial`);
       [rows] = await pool.query(
-        "SELECT id_usuario, us_nombre, us_apellidop, us_correo, us_telefono, id_perfil FROM usuarios WHERE ? LIKE CONCAT('%', us_telefono, '%') AND us_telefono != '0' AND us_telefono != '2147483647' LIMIT 1",
+        "SELECT id_usuario, us_nombre, us_apellidop, us_correo, us_telefono, id_perfil FROM usuarios WHERE ? LIKE CONCAT('%', us_telefono, '%') AND us_telefono != '0' AND us_telefono != '2147483647' AND LENGTH(us_telefono) >= 10 LIMIT 1",
         [phoneNumber]
       );
       logger.info(`Búsqueda por coincidencia parcial: ${rows.length} resultados`);
@@ -1180,9 +1180,18 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
 
       await clearFlow(pool, phoneNumber);
 
-      const textoPago = esParcial
-        ? `💳 *Pago Parcial de Reserva (25%)*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Precio total:* $${precioTotal} ${slot.moneda}\n💵 *Pagas ahora:* $${montoCobrar} ${slot.moneda}\n🏦 *Pagas en el club:* $${restanteEnClub} ${slot.moneda}\n\n👉 Haz clic en el siguiente enlace para pagar:\n${session.url}\n\n⏱️ El enlace expira en 30 minutos.\n_Tu reserva se confirmará automáticamente al completar el pago._`
-        : `💳 *Pago Completo de Reserva*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Total:* $${precioTotal} ${slot.moneda}\n\n👉 Haz clic en el siguiente enlace para pagar:\n${session.url}\n\n⏱️ El enlace expira en 30 minutos.\n_Tu reserva se confirmará automáticamente al completar el pago._`;
+      const resumenParcial = `💳 *Pago Parcial de Reserva (25%)*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Precio total:* $${precioTotal} ${slot.moneda}\n💵 *Pagas ahora:* $${montoCobrar} ${slot.moneda}\n🏦 *Pagas en el club:* $${restanteEnClub} ${slot.moneda}`;
+      const resumenCompleto = `💳 *Pago Completo de Reserva*\n\n🏟️ *Club:* ${clubNombre}\n🎾 *Cancha:* ${canchaNombre}\n📅 *Fecha:* ${fechaLabel}\n⏰ *Horario:* ${slot.inicio} - ${slot.fin}\n💰 *Total:* $${precioTotal} ${slot.moneda}`;
+
+      const resumen = esParcial ? resumenParcial : resumenCompleto;
+
+      const textoPago = `${resumen}\n\n` +
+        `*Elige cómo pagar:*\n\n` +
+        `💻 *Pagar por Web:*\n${session.url}\n\n` +
+        `📱 *Pagar desde la App (más rápido con tus tarjetas guardadas):*\n` +
+        `▸ Android: https://play.google.com/store/apps/details?id=arosports.app\n` +
+        `▸ iOS: https://apps.apple.com/mx/app/arosports/id6755505424\n\n` +
+        `⏱️ El enlace web expira en 30 minutos.\n_Tu reserva se confirmará automáticamente al completar el pago._`;
 
       return { type: "text", text: textoPago };
     }
@@ -1956,9 +1965,10 @@ async function handleFlujoSoporte(pool, phoneNumber, userInput, currentStep, dra
           title: "Soporte",
           rows: [
             { id: "1", title: "📝 Levantar un reporte", description: "Crea un ticket de soporte" },
-            { id: "2", title: "📞 Contactar asesor", description: "Datos de contacto directo" },
-            { id: "3", title: "❓ Preguntas frecuentes", description: "Consulta dudas comunes" },
-            { id: "4", title: "🏠 Volver al menú", description: "Regresar al menú principal" },
+            { id: "2", title: "� Mis reportes", description: "Ver estado y respuestas de tus tickets" },
+            { id: "3", title: "📞 Contactar asesor", description: "Datos de contacto directo" },
+            { id: "4", title: "❓ Preguntas frecuentes", description: "Consulta dudas comunes" },
+            { id: "5", title: "🏠 Volver al menú", description: "Regresar al menú principal" },
           ],
         },
       ],
@@ -1982,7 +1992,77 @@ Vamos a crear tu reporte paso a paso.
 Ejemplo: "Error al reservar cancha" o "Problema con pago"`,
         };
 
-      case "2":
+      case "2": {
+        // Mis reportes - mostrar tickets del usuario
+        const usuario = draft?.user;
+        if (!usuario || !usuario.id_usuario) {
+          return {
+            type: "text",
+            text: `❌ No se pudo obtener tu información de usuario.${textoVolverMenu()}`
+          };
+        }
+
+        const [tickets] = await pool.query(
+          `SELECT id, subject, status, priority, created_at,
+            (SELECT COUNT(*) FROM soporte_ticket_responses r WHERE r.ticket_id = soporte_tickets.id AND r.is_agent = 1 
+              AND r.created_at > COALESCE(
+                (SELECT MAX(r2.created_at) FROM soporte_ticket_responses r2 WHERE r2.ticket_id = soporte_tickets.id AND r2.is_agent = 0),
+                soporte_tickets.created_at
+              )
+            ) AS respuestas_nuevas
+           FROM soporte_tickets 
+           WHERE id_usuario = ? AND status IN ('open', 'in_progress', 'waiting_response')
+           ORDER BY created_at DESC
+           LIMIT 10`,
+          [usuario.id_usuario]
+        );
+
+        if (tickets.length === 0) {
+          await clearFlow(pool, phoneNumber);
+          return {
+            type: "text",
+            text: `📋 *Mis Reportes*\n\nNo tienes reportes abiertos en este momento.\n\nSi necesitas ayuda, puedes levantar un nuevo reporte desde el menú de soporte.${textoVolverMenu()}`
+          };
+        }
+
+        await saveDraftData(pool, phoneNumber, "mis_tickets", tickets);
+        await setFlow(pool, phoneNumber, "soporte", "ver_lista_tickets");
+
+        const statusLabels = {
+          open: "🟡 Abierto",
+          in_progress: "🔵 En proceso",
+          waiting_response: "🟢 Con respuesta",
+          resolved: "✅ Resuelto",
+          closed: "⚫ Cerrado"
+        };
+
+        const rows = tickets.map((t, i) => {
+          const statusLabel = statusLabels[t.status] || t.status;
+          const nuevas = t.respuestas_nuevas > 0 ? ` (${t.respuestas_nuevas} nueva${t.respuestas_nuevas > 1 ? 's' : ''})` : '';
+          const prefijo = `#${t.id} - `;
+          const maxAsunto = 24 - prefijo.length;
+          return {
+            id: String(i + 1),
+            title: `${prefijo}${t.subject.substring(0, maxAsunto)}`,
+            description: `${statusLabel}${nuevas}`.substring(0, 72)
+          };
+        });
+
+        return {
+          type: "list",
+          headerText: "📋 Mis Reportes",
+          bodyText: `Tienes ${tickets.length} reporte${tickets.length > 1 ? 's' : ''} abierto${tickets.length > 1 ? 's' : ''}.\n\nSelecciona uno para ver los detalles y respuestas:`,
+          buttonText: "Ver reportes",
+          sections: [
+            {
+              title: "Reportes",
+              rows: [...rows, { id: "0", title: "🔙 Volver", description: "Volver al menú de soporte" }]
+            }
+          ]
+        };
+      }
+
+      case "3":
         await clearFlow(pool, phoneNumber);
         return {
           type: "text",
@@ -1998,7 +2078,7 @@ _Nota: Esta es información de demostración._
 ${textoVolverMenu()}`,
         };
 
-      case "3":
+      case "4":
         // Obtener categorías de FAQ desde la BD
         const [categorias] = await pool.query(
           `SELECT id, nombre, descripcion FROM faq_categorias ORDER BY id ASC`
@@ -2028,7 +2108,7 @@ ${textoVolverMenu()}`,
           text: mensajeCategorias
         };
 
-      case "4":
+      case "5":
         await clearFlow(pool, phoneNumber);
         const tieneSuscripcion = draft?.tieneSuscripcionActiva || false;
         return menuPrincipal(null, tieneSuscripcion);
@@ -2036,7 +2116,7 @@ ${textoVolverMenu()}`,
       default:
         return {
           type: "text",
-          text: " Opción inválida. Por favor elige un número del 1 al 4.",
+          text: " Opción inválida. Por favor elige un número del 1 al 5.",
         };
     }
   }
@@ -2239,6 +2319,165 @@ _Solo puedes enviar 1 imagen (JPG, PNG, GIF, WEBP)_`,
     return {
       type: "text",
       text: `❓ *${preguntaSeleccionada.pregunta}*\n\n${preguntaSeleccionada.respuesta}${textoVolverMenu()}`
+    };
+  }
+
+  // ─── VER LISTA DE TICKETS: Usuario selecciona un ticket ───
+  if (currentStep === "ver_lista_tickets") {
+    if (userInput === "0") {
+      await setFlow(pool, phoneNumber, "soporte", "inicio");
+      return await handleFlujoSoporte(pool, phoneNumber, userInput, "inicio", draft, token, phoneNumberId);
+    }
+
+    const tickets = await getDraftData(pool, phoneNumber, "mis_tickets");
+    const indice = parseInt(userInput) - 1;
+
+    if (!tickets || isNaN(indice) || indice < 0 || indice >= tickets.length) {
+      return {
+        type: "text",
+        text: `❌ Opción inválida. Por favor selecciona un reporte de la lista.`
+      };
+    }
+
+    const ticket = tickets[indice];
+    await saveDraftData(pool, phoneNumber, "ticket_seleccionado_id", ticket.id);
+
+    // Obtener respuestas del ticket
+    const [respuestas] = await pool.query(
+      `SELECT r.message, r.is_agent, r.created_at, u.us_nombre 
+       FROM soporte_ticket_responses r
+       LEFT JOIN usuarios u ON r.id_usuario = u.id_usuario
+       WHERE r.ticket_id = ?
+       ORDER BY r.created_at ASC`,
+      [ticket.id]
+    );
+
+    const statusLabels = {
+      open: "🟡 Abierto",
+      in_progress: "🔵 En proceso",
+      waiting_response: "🟢 Con respuesta",
+      resolved: "✅ Resuelto",
+      closed: "⚫ Cerrado"
+    };
+
+    const statusLabel = statusLabels[ticket.status] || ticket.status;
+    const fechaCreacion = new Date(ticket.created_at).toLocaleString("es-MX", { timeZone: "America/Mexico_City", dateStyle: "medium", timeStyle: "short" });
+
+    let mensaje = `📋 *Reporte #${ticket.id}*\n\n`;
+    mensaje += `📌 *Asunto:* ${ticket.subject}\n`;
+    mensaje += `📊 *Estado:* ${statusLabel}\n`;
+    mensaje += `📅 *Creado:* ${fechaCreacion}\n`;
+
+    if (respuestas.length > 0) {
+      mensaje += `\n━━━━━━━━━━━━━━━━━━\n`;
+      mensaje += `💬 *Conversación:*\n`;
+      
+      // Mostrar las últimas 5 respuestas para no exceder el límite
+      const ultimasRespuestas = respuestas.slice(-5);
+      if (respuestas.length > 5) {
+        mensaje += `_(Mostrando últimas 5 de ${respuestas.length} mensajes)_\n`;
+      }
+
+      for (const resp of ultimasRespuestas) {
+        const fechaResp = new Date(resp.created_at).toLocaleString("es-MX", { timeZone: "America/Mexico_City", dateStyle: "short", timeStyle: "short" });
+        const autor = resp.is_agent ? `🛡️ Soporte${resp.us_nombre ? ` (${resp.us_nombre})` : ''}` : `👤 Tú`;
+        mensaje += `\n${autor} — _${fechaResp}_\n${resp.message}\n`;
+      }
+    } else {
+      mensaje += `\n_Aún no hay respuestas. Te responderemos en 24-48 hrs._\n`;
+    }
+
+    await setFlow(pool, phoneNumber, "soporte", "ver_detalle_ticket");
+
+    // Si el ticket no está cerrado ni resuelto, permitir responder
+    if (ticket.status !== "closed" && ticket.status !== "resolved") {
+      return {
+        type: "button",
+        bodyText: mensaje,
+        buttons: [
+          { type: "reply", reply: { id: "responder_ticket", title: "✍️ Responder" } },
+          { type: "reply", reply: { id: "volver_tickets", title: "🔙 Mis reportes" } },
+          { type: "reply", reply: { id: "volver_menu_soporte", title: "🏠 Menú soporte" } },
+        ],
+      };
+    } else {
+      return {
+        type: "button",
+        bodyText: mensaje,
+        buttons: [
+          { type: "reply", reply: { id: "volver_tickets", title: "🔙 Mis reportes" } },
+          { type: "reply", reply: { id: "volver_menu_soporte", title: "🏠 Menú soporte" } },
+        ],
+      };
+    }
+  }
+
+  // ─── VER DETALLE TICKET: Acciones (responder, volver) ───
+  if (currentStep === "ver_detalle_ticket") {
+    if (userInput === "volver_tickets") {
+      // Volver a la lista de tickets (re-consultarlos)
+      await setFlow(pool, phoneNumber, "soporte", "menu_soporte");
+      return await handleFlujoSoporte(pool, phoneNumber, "2", "menu_soporte", draft, token, phoneNumberId);
+    }
+
+    if (userInput === "volver_menu_soporte") {
+      await setFlow(pool, phoneNumber, "soporte", "inicio");
+      return await handleFlujoSoporte(pool, phoneNumber, userInput, "inicio", draft, token, phoneNumberId);
+    }
+
+    if (userInput === "responder_ticket") {
+      await setFlow(pool, phoneNumber, "soporte", "escribir_respuesta_ticket");
+      return {
+        type: "text",
+        text: `✍️ *Responder al reporte*\n\nEscribe tu mensaje de respuesta:`,
+      };
+    }
+
+    return {
+      type: "text",
+      text: "Por favor selecciona una de las opciones disponibles."
+    };
+  }
+
+  // ─── ESCRIBIR RESPUESTA AL TICKET ───
+  if (currentStep === "escribir_respuesta_ticket") {
+    if (userInput.length < 3) {
+      return {
+        type: "text",
+        text: "❌ El mensaje es muy corto (mínimo 3 caracteres). Escribe tu respuesta:"
+      };
+    }
+
+    const ticketId = await getDraftData(pool, phoneNumber, "ticket_seleccionado_id");
+    const usuario = draft?.user;
+
+    if (!ticketId || !usuario) {
+      await clearFlow(pool, phoneNumber);
+      return {
+        type: "text",
+        text: `❌ Ocurrió un error. Por favor intenta de nuevo.${textoVolverMenu()}`
+      };
+    }
+
+    // Insertar la respuesta del usuario
+    await pool.query(
+      `INSERT INTO soporte_ticket_responses (ticket_id, id_usuario, message, is_agent, created_at) 
+       VALUES (?, ?, ?, 0, NOW())`,
+      [ticketId, usuario.id_usuario, userInput]
+    );
+
+    // Actualizar el status del ticket a 'open' (el usuario respondió, espera al agente)
+    await pool.query(
+      `UPDATE soporte_tickets SET status = 'open', updated_at = NOW() WHERE id = ?`,
+      [ticketId]
+    );
+
+    logger.info(`💬 Respuesta del usuario ${phoneNumber} agregada al ticket #${ticketId}`);
+
+    await clearFlow(pool, phoneNumber);
+    return {
+      type: "text",
+      text: `✅ *Respuesta enviada*\n\nTu mensaje fue agregado al reporte #${ticketId}.\n\nEl equipo de soporte lo revisará y te responderá pronto.${textoVolverMenu()}`
     };
   }
 
@@ -2713,7 +2952,7 @@ export const whatsappWebhookPadel = onRequest(
         if (!usuarioCompleto) {
           response = {
             type: "text",
-            text: `👋 ¡Bienvenido al bot de ArosPorts!\n\nLo sentimos, no pudimos encontrar tu usuario en nuestro sistema.\n\nPuedes registrarte en:\n🔗 https://arosports.app/arosport/login\n\nUna vez registrado, escribe *Hola* para acceder a todas las funciones del bot.`,
+            text: `👋 ¡Bienvenido al bot de ArosPorts!\n\nLo sentimos, no pudimos encontrar tu usuario en nuestro sistema.\n\nDescarga nuestra app y regístrate:\n📱 *Android:* https://play.google.com/store/apps/details?id=arosports.app\n🍎 *iOS:* https://apps.apple.com/mx/app/arosports/id6755505424\n\nO regístrate desde la web:\n🔗 https://arosports.app/arosport/login\n\nUna vez registrado, escribe *Hola* para acceder a todas las funciones del bot.`,
           };
         } else {
           response = menuPrincipal(nombreUsuario, tieneSuscripcion);
