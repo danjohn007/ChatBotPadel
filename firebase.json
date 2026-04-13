@@ -2,7 +2,15 @@
   "hosting": {
     "public": "public",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
-    "cleanUrls": true
+    "cleanUrls": true,
+    "rewrites": [
+      {
+        "source": "/p/**",
+        "function": {
+          "functionId": "redirectPago"
+        }
+      }
+    ]
   },
   "functions": [
     {
