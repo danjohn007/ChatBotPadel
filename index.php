@@ -26,8 +26,8 @@
 
 // Ruta absoluta en el servidor donde se guardarán las imágenes.
 // Ejemplos:
-//   '/home/tu_usuario/public_html/api/uploads/tickets/'
-//   '/var/www/html/arosports/api/uploads/tickets/'
+//   '/home/tu_usuario/public_html/api/api/uploads/tickets/'
+//   '/var/www/html/arosports/api/api/uploads/tickets/'
 define('UPLOAD_DIR', '/home2/arosports/public_html/api/api/uploads/tickets/');
 
 // URL pública de esa misma carpeta (sin barra al final no importa, se agrega).

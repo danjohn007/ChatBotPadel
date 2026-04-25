@@ -1,10 +1,16 @@
 <?php
 /**
  * Endpoint para recibir imágenes de tickets desde WhatsApp
- * Ruta: https://arosports.app/api/api/uploads/tickets
+ * Ruta sugerida del endpoint: https://arosports.app/api/upload-ticket-image.php
  * Método: POST
  * Content-Type: multipart/form-data
  */
+
+// Ruta absoluta en el servidor donde se guardarán las imágenes.
+define('UPLOAD_DIR', '/home2/arosports/public_html/api/api/uploads/tickets/');
+
+// URL pública base de esa misma carpeta.
+define('BASE_URL', 'https://arosports.app/api/api/uploads/tickets');
 
 // Configuración de headers
 header('Content-Type: application/json');
@@ -29,8 +35,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // Configuración del directorio de uploads
-// Asegúrate de que esta ruta sea correcta en tu servidor
-$uploadDir = __DIR__ . '/';  // Guarda en el mismo directorio donde está este PHP
+$uploadDir = rtrim(UPLOAD_DIR, '/') . '/';
 
 // Crear directorio si no existe
 if (!file_exists($uploadDir)) {
@@ -107,7 +112,7 @@ try {
     $relativePath = 'uploads/tickets/' . $filename;
     
     // Construir la URL completa de la imagen
-    $imageUrl = 'https://arosports.app/api/api/uploads/tickets/' . $filename;
+    $imageUrl = rtrim(BASE_URL, '/') . '/' . $filename;
 
     // Respuesta exitosa
     http_response_code(200);

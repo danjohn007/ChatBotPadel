@@ -12,6 +12,9 @@ import mysql from "mysql2/promise";                       // Cliente MySQL para 
 import Stripe from "stripe";                              // Stripe SDK para pagos
 import crypto from "crypto";                              // Para generar códigos cortos seguros
 
+const TICKET_IMAGE_UPLOAD_ENDPOINT = "https://arosports.app/api/api/uploads/tickets/upload-ticket-image.php";
+const TICKET_IMAGE_PUBLIC_BASE_URL = "https://arosports.app/api/api/uploads/tickets/";
+
 // =========================================================
 // 🔐 SECRETS (valores sensibles, definidos en Firebase)
 // =========================================================
@@ -128,7 +131,7 @@ async function downloadAndUploadWhatsAppImage(imageId, token, ticketId) {
     
     // Llamar al endpoint de ArosPorts para subir el archivo
     const uploadResponse = await axios.post(
-      'https://arosports.app/api/api/uploads/tickets/',
+      TICKET_IMAGE_UPLOAD_ENDPOINT,
       formData,
       {
         headers: {
@@ -141,15 +144,35 @@ async function downloadAndUploadWhatsAppImage(imageId, token, ticketId) {
     );
     
     logger.info(`📨 Respuesta del servidor:`, uploadResponse.data);
+
+    const uploadedFilename = uploadResponse.data?.filename;
+    const uploadedPublicUrl = (() => {
+      const rawUrl = uploadResponse.data?.url;
+      if (typeof rawUrl === "string" && /^https?:\/\//i.test(rawUrl)) {
+        return rawUrl;
+      }
+
+      if (uploadedFilename) {
+        return `${TICKET_IMAGE_PUBLIC_BASE_URL}${uploadedFilename}`;
+      }
+
+      const rawPath = uploadResponse.data?.filepath;
+      if (typeof rawPath === "string" && rawPath.trim()) {
+        const normalizedPath = rawPath.replace(/^\/+/, "");
+        return `https://arosports.app/${normalizedPath}`;
+      }
+
+      return null;
+    })();
     
-    if (uploadResponse.data && uploadResponse.data.filepath) {
-      const filepath = uploadResponse.data.filepath;
+    if (uploadResponse.data && (uploadResponse.data.filepath || uploadedPublicUrl)) {
+      const filepath = uploadedPublicUrl || uploadResponse.data.filepath;
       logger.info(`✅ Imagen subida exitosamente: ${filepath}`);
       
       // Retornar objeto completo con toda la información
       return {
         filepath: filepath,
-        filename: uploadResponse.data.filename || filepath.split('/').pop(),
+        filename: uploadedFilename || filepath.split('/').pop(),
         filesize: uploadResponse.data.size || imageBuffer.length,
         mimetype: contentType,
       };
@@ -585,6 +608,27 @@ function normalizeCommandText(input = "") {
     .trim();
 }
 
+function getMexicoCitySqlDateTime(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Mexico_City",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const valueByType = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  return `${valueByType.year}-${valueByType.month}-${valueByType.day} ${valueByType.hour}:${valueByType.minute}:${valueByType.second}`;
+}
+
 /**
  * Genera un código corto alfanumérico seguro (8 caracteres)
  */
@@ -885,9 +929,52 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     await saveDraftData(pool, phoneNumber, "dia_semana", fechaSeleccionada.dia);
 
     const estadoSeleccionado = await getDraftData(pool, phoneNumber, "estado");
+    await setFlow(pool, phoneNumber, "reservas", "preguntar_franja");
 
-    // Buscar clubs del estado que tengan al menos una cancha con tarifas para ese día
-    // Lógica alineada con la app móvil: tipo=5, horarios_club activos, tarifas tipo=1 con campos válidos
+    return {
+      type: "button",
+      bodyText: `📅 *${fechaSeleccionada.label}* — 📍 *${estadoSeleccionado}*\n\n¿En qué franja horaria prefieres jugar?\n\n_También puedes escribir una hora exacta, ej: "10:00" o "18"_`,
+      buttons: [
+        { type: "reply", reply: { id: "franja_manana", title: "🌅 Mañana (6-12h)" } },
+        { type: "reply", reply: { id: "franja_tarde", title: "☀️ Tarde (12-18h)" } },
+        { type: "reply", reply: { id: "franja_noche", title: "🌙 Noche (18-23h)" } },
+      ],
+    };
+  }
+
+  // ─── PASO 3: Guardar franja y buscar clubs ───
+  if (currentStep === "preguntar_franja") {
+    let horaMin = 0, horaMax = 24, franjaLabel = "Todos los horarios";
+
+    if (userInput === "franja_manana") {
+      horaMin = 6; horaMax = 12; franjaLabel = "🌅 Mañana (6:00 - 12:00)";
+    } else if (userInput === "franja_tarde") {
+      horaMin = 12; horaMax = 18; franjaLabel = "☀️ Tarde (12:00 - 18:00)";
+    } else if (userInput === "franja_noche") {
+      horaMin = 18; horaMax = 24; franjaLabel = "🌙 Noche (18:00 en adelante)";
+    } else {
+      const horaMatch = userInput.match(/^(\d{1,2})(?::(\d{2}))?/);
+      if (horaMatch) {
+        const h = parseInt(horaMatch[1]);
+        horaMin = Math.max(0, h - 1);
+        horaMax = Math.min(24, h + 3);
+        franjaLabel = `Cerca de ${String(h).padStart(2, "0")}:00`;
+      }
+    }
+
+    await saveDraftData(pool, phoneNumber, "franja_preferida", { horaMin, horaMax, label: franjaLabel });
+
+    // Si hay club preseleccionado (viene desde info_club), saltar directo a canchas
+    const clubPresel = await getDraftData(pool, phoneNumber, "club_preseleccionado");
+    if (clubPresel) {
+      const clubId = await getDraftData(pool, phoneNumber, "club_id");
+      return await handleFlujoReservas(pool, phoneNumber, `club_preseleccionado_${clubId}`, "seleccionar_club", draft, token, phoneNumberId);
+    }
+
+    const diaSemana = await getDraftData(pool, phoneNumber, "dia_semana");
+    const estadoSel = await getDraftData(pool, phoneNumber, "estado");
+    const fechaLbl = await getDraftData(pool, phoneNumber, "fecha_label");
+
     const [clubs] = await pool.query(
       `SELECT DISTINCT fc.id_fraccionamientoclub AS id_club, fc.fc_nombre AS nombre, dc.direccion AS colonia
        FROM fraccionamiento_club fc
@@ -900,21 +987,21 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
        WHERE dc.estado LIKE ? AND fc.id_status = 1 AND fc.tipo = 5
        ORDER BY fc.fc_nombre
        LIMIT 10`,
-      [fechaSeleccionada.dia, fechaSeleccionada.dia, `%${estadoSeleccionado}%`]
+      [diaSemana, diaSemana, `%${estadoSel}%`]
     );
 
     if (clubs.length === 0) {
       await clearFlow(pool, phoneNumber);
       return {
         type: "text",
-        text: `No encontré clubs con disponibilidad para *${fechaSeleccionada.label}* en *${estadoSeleccionado}*.` + textoVolverMenu(),
+        text: `No encontré clubs con disponibilidad para *${fechaLbl}* en *${estadoSel}*.` + textoVolverMenu(),
       };
     }
 
     await saveDraftData(pool, phoneNumber, "clubs_disponibles", clubs);
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_club");
 
-    const rows = clubs.map((club, idx) => ({
+    const rowsClubs = clubs.map((club, idx) => ({
       id: `club_${idx}`,
       title: club.nombre.substring(0, 24),
       description: club.colonia ? club.colonia.substring(0, 72) : "Club de pádel",
@@ -923,9 +1010,9 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
     return {
       type: "list",
       headerText: `Clubs disponibles`,
-      bodyText: `📍 *${estadoSeleccionado}* - 📅 *${fechaSeleccionada.label}*\n\nEstos clubs tienen canchas disponibles:`,
+      bodyText: `📍 *${estadoSel}* — 📅 *${fechaLbl}* — ${franjaLabel}\n\nEstos clubs tienen canchas disponibles:`,
       buttonText: "Ver clubs",
-      sections: [{ title: "Clubs disponibles", rows }],
+      sections: [{ title: "Clubs disponibles", rows: rowsClubs }],
     };
   }
 
@@ -1082,64 +1169,134 @@ async function handleFlujoReservas(pool, phoneNumber, userInput, currentStep, dr
       };
     }
 
-    await saveDraftData(pool, phoneNumber, "slots_disponibles", slotsUnicos);
+    // Aplicar franja preferida guardada sin volver a preguntar
+    const franjaGuardadaCancha = await getDraftData(pool, phoneNumber, "franja_preferida");
+    let slotsParaUsar = slotsUnicos;
+    let franjaLabelCancha = "Todos los horarios";
+
+    if (franjaGuardadaCancha && (franjaGuardadaCancha.horaMin > 0 || franjaGuardadaCancha.horaMax < 24)) {
+      const filtrados = slotsUnicos.filter(s => {
+        const h = parseInt(s.inicio.split(":")[0]);
+        return h >= franjaGuardadaCancha.horaMin && h < franjaGuardadaCancha.horaMax;
+      });
+      if (filtrados.length > 0) {
+        slotsParaUsar = filtrados;
+        franjaLabelCancha = franjaGuardadaCancha.label;
+      } else {
+        franjaLabelCancha = "Todos los horarios (no hay en tu franja preferida)";
+      }
+    }
+
+    await saveDraftData(pool, phoneNumber, "slots_disponibles", slotsParaUsar);
     await saveDraftData(pool, phoneNumber, "slots_offset", 0);
     await setFlow(pool, phoneNumber, "reservas", "seleccionar_horario");
-
-    // Paginar slots
-    const { slots: slotsParaMostrar, hayMas } = paginarSlots(slotsUnicos, 0);
-
-    // Agrupar por duración
-    const porDuracion = {};
-    for (const slot of slotsParaMostrar) {
-      if (!porDuracion[slot.duracion]) porDuracion[slot.duracion] = [];
-      porDuracion[slot.duracion].push(slot);
-    }
-
-    const sections = [];
-    const crearFilas = (slots) =>
-      slots.map((slot) => ({
-        id: `slot_${slotsUnicos.indexOf(slot)}`,
-        title: `${slot.inicio} - ${slot.fin}`,
-        description: `${slot.duracion}hr - $${slot.precio} ${slot.moneda}`,
-      }));
-
-    for (const dur of Object.keys(porDuracion).sort((a, b) => a - b)) {
-      const grupo = porDuracion[dur];
-      const titulo = `${dur} Hora${dur > 1 ? "s" : ""}`;
-      sections.push({ title: titulo, rows: crearFilas(grupo) });
-    }
-
-    if (sections.length === 0) {
-      sections.push({ title: "Horarios", rows: crearFilas(slotsParaMostrar) });
-    }
-
-    // Agregar opción "Ver más" si hay más horarios
-    if (hayMas) {
-      const mostrados = slotsParaMostrar.length;
-      const restantes = slotsUnicos.length - mostrados;
-      sections.push({
-        title: "Más opciones",
-        rows: [{
-          id: "ver_mas_horarios",
-          title: `Ver más horarios (${restantes})`,
-          description: `Mostrando ${mostrados} de ${slotsUnicos.length}`,
-        }],
-      });
-    }
 
     const canchaNombre = canchaSeleccionada.can_nombre;
     const fechaLabel = await getDraftData(pool, phoneNumber, "fecha_label");
 
-    const totalRows = sections.reduce((sum, s) => sum + s.rows.length, 0);
-    logger.info(`Horarios list: ${slotsUnicos.length} slots totales, mostrando ${totalRows} en ${sections.length} secciones (página 1)`);
+    const { slots: slotsPageCancha, hayMas: hayMasCancha } = paginarSlots(slotsParaUsar, 0);
+    const porDurCancha = {};
+    for (const slot of slotsPageCancha) {
+      if (!porDurCancha[slot.duracion]) porDurCancha[slot.duracion] = [];
+      porDurCancha[slot.duracion].push(slot);
+    }
+    const sectionsCancha = [];
+    const crearFilasCancha = (slotsPage) =>
+      slotsPage.map((slot) => ({
+        id: `slot_${slotsParaUsar.indexOf(slot)}`,
+        title: `${slot.inicio} - ${slot.fin}`,
+        description: `${slot.duracion}hr - $${slot.precio} ${slot.moneda}`,
+      }));
+    for (const dur of Object.keys(porDurCancha).sort((a, b) => a - b)) {
+      sectionsCancha.push({ title: `${dur} Hora${dur > 1 ? "s" : ""}`, rows: crearFilasCancha(porDurCancha[dur]) });
+    }
+    if (sectionsCancha.length === 0) {
+      sectionsCancha.push({ title: "Horarios", rows: crearFilasCancha(slotsPageCancha) });
+    }
+    if (hayMasCancha) {
+      const mostrados = slotsPageCancha.length;
+      const restantes = slotsParaUsar.length - mostrados;
+      sectionsCancha.push({
+        title: "Más opciones",
+        rows: [{ id: "ver_mas_horarios", title: `Ver más horarios (${restantes})`, description: `Mostrando ${mostrados} de ${slotsParaUsar.length}` }],
+      });
+    }
 
     return {
       type: "list",
       headerText: "Horarios Disponibles",
-      bodyText: `*${canchaNombre}* - *${fechaLabel}*\n\nSelecciona un horario:`,
+      bodyText: `🎾 *${canchaNombre}* - 📅 *${fechaLabel}*\n${franjaLabelCancha}\n\nSelecciona un horario:`,
       buttonText: "Ver horarios",
-      sections,
+      sections: sectionsCancha,
+    };
+  }
+
+  // ─── PASO 5b: Aplicar franja preferida guardada al mostrar horarios ───
+  if (currentStep === "filtrar_horario") {
+    const todosLosSlots = await getDraftData(pool, phoneNumber, "slots_disponibles");
+    const franjaGuardada = await getDraftData(pool, phoneNumber, "franja_preferida");
+    let slotsFiltrados = todosLosSlots;
+    let franjaLabel = "Todos los horarios";
+
+    if (franjaGuardada && (franjaGuardada.horaMin > 0 || franjaGuardada.horaMax < 24)) {
+      const filtrados = todosLosSlots.filter(s => {
+        const h = parseInt(s.inicio.split(":")[0]);
+        return h >= franjaGuardada.horaMin && h < franjaGuardada.horaMax;
+      });
+      // Si hay slots en la franja preferida los usamos; si no, mostramos todos
+      if (filtrados.length > 0) {
+        slotsFiltrados = filtrados;
+        franjaLabel = franjaGuardada.label;
+      } else {
+        franjaLabel = "Todos los horarios (no hay en tu franja preferida)";
+      }
+    }
+
+    // Guardar slots filtrados y avanzar a seleccionar_horario
+    await saveDraftData(pool, phoneNumber, "slots_disponibles", slotsFiltrados);
+    await saveDraftData(pool, phoneNumber, "slots_offset", 0);
+    await setFlow(pool, phoneNumber, "reservas", "seleccionar_horario");
+
+    const { slots: slotsParaMostrarF, hayMasF } = paginarSlots(slotsFiltrados, 0);
+
+    const porDuracionF = {};
+    for (const slot of slotsParaMostrarF) {
+      if (!porDuracionF[slot.duracion]) porDuracionF[slot.duracion] = [];
+      porDuracionF[slot.duracion].push(slot);
+    }
+
+    const sectionsF = [];
+    const crearFilasF = (slotsPage) =>
+      slotsPage.map((slot) => ({
+        id: `slot_${slotsFiltrados.indexOf(slot)}`,
+        title: `${slot.inicio} - ${slot.fin}`,
+        description: `${slot.duracion}hr - $${slot.precio} ${slot.moneda}`,
+      }));
+
+    for (const durF of Object.keys(porDuracionF).sort((a, b) => a - b)) {
+      sectionsF.push({ title: `${durF} Hora${durF > 1 ? "s" : ""}`, rows: crearFilasF(porDuracionF[durF]) });
+    }
+    if (sectionsF.length === 0) {
+      sectionsF.push({ title: "Horarios", rows: crearFilasF(slotsParaMostrarF) });
+    }
+    if (hayMasF) {
+      const mostradosF = slotsParaMostrarF.length;
+      const restantesF = slotsFiltrados.length - mostradosF;
+      sectionsF.push({
+        title: "Más opciones",
+        rows: [{ id: "ver_mas_horarios", title: `Ver más horarios (${restantesF})`, description: `Mostrando ${mostradosF} de ${slotsFiltrados.length}` }],
+      });
+    }
+
+    const cNombreFiltro = await getDraftData(pool, phoneNumber, "cancha_nombre");
+    const fLabelFiltro = await getDraftData(pool, phoneNumber, "fecha_label");
+
+    return {
+      type: "list",
+      headerText: "Horarios Disponibles",
+      bodyText: `*${cNombreFiltro}* - *${fLabelFiltro}*\n${franjaLabel}\n\nSelecciona un horario:`,
+      buttonText: "Ver horarios",
+      sections: sectionsF,
     };
   }
 
@@ -2661,17 +2818,19 @@ _Solo puedes enviar 1 imagen (JPG, PNG, GIF, WEBP)_`,
       };
     }
 
+    const responseCreatedAt = getMexicoCitySqlDateTime();
+
     // Insertar la respuesta del usuario
     await pool.query(
       `INSERT INTO soporte_ticket_responses (ticket_id, id_usuario, message, is_agent, created_at) 
-       VALUES (?, ?, ?, 0, NOW())`,
-      [ticketId, usuario.id_usuario, userInput]
+       VALUES (?, ?, ?, 0, ?)`,
+      [ticketId, usuario.id_usuario, userInput, responseCreatedAt]
     );
 
     // Actualizar el status del ticket a 'open' (el usuario respondió, espera al agente)
     await pool.query(
-      `UPDATE soporte_tickets SET status = 'open', updated_at = NOW() WHERE id = ?`,
-      [ticketId]
+      `UPDATE soporte_tickets SET status = 'open', updated_at = ? WHERE id = ?`,
+      [responseCreatedAt, ticketId]
     );
 
     logger.info(`💬 Respuesta del usuario ${phoneNumber} agregada al ticket #${ticketId}`);
@@ -2712,6 +2871,7 @@ ${textoVolverMenu()}`,
 async function crearReporte(pool, phoneNumber, imageUrl, whatsappToken) {
   try {
     logger.info(`🎫 Iniciando creación de reporte para ${phoneNumber}`);
+    const ticketCreatedAt = getMexicoCitySqlDateTime();
     
     // 1. PRIMERO intentar obtener datos del usuario desde el DRAFT (guardados cuando dijo "Hola")
     const draft = await getDraft(pool, phoneNumber);
@@ -2783,8 +2943,8 @@ ${textoVolverMenu()}`,
       `INSERT INTO soporte_tickets 
        (id_usuario, user_profile_id, user_profile_name, user_full_name, 
         user_phone, user_email, category_id, subject, description, 
-        priority, status, created_at) 
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'medium', 'open', NOW())`,
+        priority, status, created_at, updated_at) 
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'medium', 'open', ?, ?)`,
       [
         usuario.id_usuario,
         usuario.id_perfil,
@@ -2794,6 +2954,8 @@ ${textoVolverMenu()}`,
         emailUsuario,
         asunto,
         descripcion,
+        ticketCreatedAt,
+        ticketCreatedAt,
       ]
     );
 
@@ -2812,13 +2974,14 @@ ${textoVolverMenu()}`,
         await pool.query(
           `INSERT INTO soporte_ticket_attachments 
            (ticket_id, filename, filepath, filesize, mimetype, created_at) 
-           VALUES (?, ?, ?, ?, ?, NOW())`,
+           VALUES (?, ?, ?, ?, ?, ?)`,
           [
             ticketId,
             imageData.filename,
             imageData.filepath,
             imageData.filesize,
             imageData.mimetype,
+            ticketCreatedAt,
           ]
         );
         logger.info(`✅ Imagen guardada exitosamente en BD:`);
