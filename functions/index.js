@@ -574,6 +574,18 @@ function textoVolverMenu() {
 }
 
 /**
+ * Normaliza texto para comandos globales (hola/cancelar) sin acentos ni puntuación.
+ */
+function normalizeCommandText(input = "") {
+  return input
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/^[^a-z0-9]+/, "")
+    .trim();
+}
+
+/**
  * Genera un código corto alfanumérico seguro (8 caracteres)
  */
 function generateShortCode() {
@@ -3105,8 +3117,9 @@ export const whatsappWebhookPadel = onRequest(
 
       let response = null;
 
-      // 1. REINICIAR FLUJO: "Hola" o "Cancelar"
-      if (userInput.toLowerCase() === "hola" || userInput.toLowerCase() === "cancelar") {
+      // 1. REINICIAR FLUJO: comandos globales (Hola/Cancelar), incluso con texto adicional.
+      const normalizedInput = normalizeCommandText(userInput);
+      if (normalizedInput.startsWith("hola") || normalizedInput.startsWith("cancelar")) {
         await clearFlow(pool, from);
         
         // Log para depuración: ver número de teléfono que llega
