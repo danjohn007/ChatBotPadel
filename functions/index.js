@@ -2428,8 +2428,8 @@ Ejemplo: "Error al reservar cancha" o "Problema con pago"`,
 
 Puedes contactarnos por:
 
-📧 Email: soporte@arosports.app
-📱 WhatsApp: +52 1 33 1234 5678
+📧 Email: soporte@arosports.org
+📱 WhatsApp: 4423613002
 ⏰ Horario: Lun-Vie 9:00 AM - 6:00 PM
 
 _Nota: Esta es información de demostración._
